@@ -1,13 +1,55 @@
-﻿# CMakeList.txt: 顶层 CMake 项目文件，在此处执行全局配置
+cmake_minimum_required(VERSION 3.21)
 
-cmake_minimum_required (VERSION 3.10)
+project(RenderingOut LANGUAGES C)
 
-# 如果支持，请为 MSVC 编译器启用热重载。
-if (POLICY CMP0141)
-  cmake_policy(SET CMP0141 NEW)
-  set(CMAKE_MSVC_DEBUG_INFORMATION_FORMAT "$<IF:$<AND:$<C_COMPILER_ID:MSVC>,$<CXX_COMPILER_ID:MSVC>>,$<$<CONFIG:Debug,RelWithDebInfo>:EditAndContinue>,$<$<CONFIG:Debug,RelWithDebInfo>:ProgramDatabase>>")
+if(NOT WIN32)
+    message(FATAL_ERROR "RenderingOut currently requires Unity's D3D11 renderer.")
 endif()
 
-project ("RenderingOut" C)
+# The Unity SDK is not a package dependency, so allow an explicit path while
+# still making the common Unity Hub installation work out of the box.
+set(UNITY_PLUGIN_API "" CACHE PATH "Unity PluginAPI directory")
+if(NOT UNITY_PLUGIN_API)
+    file(GLOB unity_plugin_api_candidates
+        "C:/Program Files/Unity/Hub/Editor/*/Editor/Data/PluginAPI")
+    list(SORT unity_plugin_api_candidates COMPARE NATURAL ORDER DESCENDING)
+    if(unity_plugin_api_candidates)
+        list(GET unity_plugin_api_candidates 0 UNITY_PLUGIN_API)
+    endif()
+endif()
 
-add_subdirectory ("src")
+if(NOT EXISTS "${UNITY_PLUGIN_API}/IUnityInterface.h")
+    message(FATAL_ERROR
+        "Unity PluginAPI was not found. Set UNITY_PLUGIN_API to "
+        "<Unity editor>/Editor/Data/PluginAPI.")
+endif()
+
+# FFmpeg is a build-time SDK dependency only. Runtime DLL deployment belongs
+# to the consuming Unity project and may come from a full/custom shared build.
+find_package(FFMPEG REQUIRED)
+
+add_library(RenderingOut SHARED
+    "src/D3D11FrameConverter.c"
+    "src/D3D11FrameConverter.h"
+    "src/RenderingOut.c"
+    "src/RenderingOut.h"
+    "src/Unity.c"
+    "src/Unity.h")
+
+target_compile_features(RenderingOut PRIVATE c_std_11)
+target_compile_definitions(RenderingOut PRIVATE
+    WIN32_LEAN_AND_MEAN
+    NOMINMAX)
+target_include_directories(RenderingOut PRIVATE
+    "${CMAKE_CURRENT_SOURCE_DIR}/src"
+    "${UNITY_PLUGIN_API}"
+    ${FFMPEG_INCLUDE_DIRS})
+target_link_libraries(RenderingOut PRIVATE
+    ${FFMPEG_LIBRARIES}
+    d3d11
+    dxgi
+    ole32)
+
+if(MSVC)
+    target_compile_options(RenderingOut PRIVATE /utf-8)
+endif()

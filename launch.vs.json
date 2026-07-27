@@ -1,0 +1,15 @@
+{
+  "version": "0.2.1",
+  "defaults": {},
+  "configurations": [
+    {
+      "type": "dll",
+      // 空执行，什么都不会干
+      "exe": "C:\\Windows\\System32\\rundll32.exe",
+      "noDebug": true,
+      "project": "CMakeLists.txt",
+      "projectTarget": "RenderingOut.dll",
+      "name": "RenderingOut.dll"
+    }
+  ]
+}
