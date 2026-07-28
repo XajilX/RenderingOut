@@ -18,653 +18,1097 @@
 #include <libavutil/hwcontext.h>
 #include <libavutil/log.h>
 #include <libavutil/mem.h>
+#include <libavutil/opt.h>
 #include <libavutil/pixdesc.h>
+#include <libswresample/swresample.h>
 
 typedef struct EncoderCandidate
 {
-    const char* name;
-    enum AVPixelFormat input_format;
-    int direct_d3d11;
+	const char* name;
+	enum AVPixelFormat input_format;
+	int direct_d3d11;
 } EncoderCandidate;
 
 typedef enum EncoderWorkerCommand
 {
-    ENCODER_COMMAND_NONE,
-    ENCODER_COMMAND_INITIALIZE,
-    ENCODER_COMMAND_ENCODE,
-    ENCODER_COMMAND_FINISH,
-    ENCODER_COMMAND_EXIT
+	ENCODER_COMMAND_NONE,
+	ENCODER_COMMAND_INITIALIZE,
+	ENCODER_COMMAND_ENCODE,
+	ENCODER_COMMAND_FINISH,
+	ENCODER_COMMAND_EXIT
 } EncoderWorkerCommand;
 
 struct VideoEncoder
 {
-    AVCodecContext* ctx;
-    AVFormatContext* format;
-    AVStream* stream;
-    AVPacket* packet;
-    AVBufferRef* hw_frames;
-    D3D11FrameConverter* converter;
-    char* filename;
+	AVCodecContext* ctx;
+	AVCodecContext* audio_ctx;
+	AVFormatContext* format;
+	AVStream* stream;
+	AVStream* audio_stream;
+	AVPacket* packet;
+	AVFrame* audio_frame;
+	AVBufferRef* hw_frames;
+	D3D11FrameConverter* converter;
+	char* filename;
+	uint8_t* pending_pcm_data;
+	int64_t pending_pcm_size;
+	int pending_pcm_sample_rate;
+	int pending_pcm_channels;
 
-    HANDLE worker;
-    CRITICAL_SECTION worker_lock;
-    CONDITION_VARIABLE worker_changed;
-    EncoderWorkerCommand worker_command;
-    AVFrame* worker_frame;
-    enum AVPixelFormat worker_texture_format;
-    int worker_multisampled;
-    int worker_result;
+	HANDLE worker;
+	CRITICAL_SECTION worker_lock;
+	CONDITION_VARIABLE worker_changed;
+	EncoderWorkerCommand worker_command;
+	AVFrame* worker_frame;
+	enum AVPixelFormat worker_texture_format;
+	int worker_multisampled;
+	int worker_result;
 
-    int bit_rate;
-    int width;
-    int height;
-    int fps;
-    int initialized;
-    int header_written;
-    int fatal_error;
-    int direct_d3d11;
-    enum AVPixelFormat texture_format;
-    enum AVPixelFormat input_format;
-    int64_t next_pts;
+	int bit_rate;
+	int width;
+	int height;
+	int fps;
+	int initialized;
+	int header_written;
+	int fatal_error;
+	int direct_d3d11;
+	enum AVPixelFormat texture_format;
+	enum AVPixelFormat input_format;
+	int64_t next_pts;
+	int64_t audio_next_pts;
+	int audio_enabled;
 };
 
-static int write_available_packets(VideoEncoder* ve)
+static int write_available_packets(
+	VideoEncoder* ve,
+	AVCodecContext* ctx,
+	AVStream* stream)
 {
-    int ret;
+	int ret;
 
-    if (!ve->header_written || !ve->stream)
-        return AVERROR(EINVAL);
+	if (!ve->header_written || !ctx || !stream)
+		return AVERROR(EINVAL);
 
-    for (;;)
-    {
-        ret = avcodec_receive_packet(ve->ctx, ve->packet);
-        if (ret == AVERROR(EAGAIN) || ret == AVERROR_EOF)
-            return 0;
-        if (ret < 0)
-            return ret;
+	for (;;)
+	{
+		ret = avcodec_receive_packet(ctx, ve->packet);
+		if (ret == AVERROR(EAGAIN) || ret == AVERROR_EOF)
+			return 0;
+		if (ret < 0)
+			return ret;
 
-        av_packet_rescale_ts(
-            ve->packet,
-            ve->ctx->time_base,
-            ve->stream->time_base);
-        ve->packet->stream_index = ve->stream->index;
+		av_packet_rescale_ts(
+			ve->packet,
+			ctx->time_base,
+			stream->time_base);
+		ve->packet->stream_index = stream->index;
 
-        ret = av_interleaved_write_frame(ve->format, ve->packet);
-        av_packet_unref(ve->packet);
-        if (ret < 0)
-            return ret;
-    }
+		ret = av_interleaved_write_frame(ve->format, ve->packet);
+		av_packet_unref(ve->packet);
+		if (ret < 0)
+			return ret;
+	}
 }
 
 static int create_hw_frames(
-    VideoEncoder* ve,
-    enum AVPixelFormat software_format,
-    AVBufferRef** frames)
+	VideoEncoder* ve,
+	enum AVPixelFormat software_format,
+	AVBufferRef** frames)
 {
-    AVBufferRef* result;
-    AVHWFramesContext* context;
-    int ret;
+	AVBufferRef* result;
+	AVHWFramesContext* context;
+	int ret;
 
-    if (!renderingout_get_hw_device())
-        return AVERROR(ENODEV);
+	if (!renderingout_get_hw_device())
+		return AVERROR(ENODEV);
 
-    result = av_hwframe_ctx_alloc(renderingout_get_hw_device());
-    if (!result)
-        return AVERROR(ENOMEM);
+	result = av_hwframe_ctx_alloc(renderingout_get_hw_device());
+	if (!result)
+		return AVERROR(ENOMEM);
 
-    context = (AVHWFramesContext*)result->data;
-    context->format = AV_PIX_FMT_D3D11;
-    context->sw_format = software_format;
-    context->width = ve->width;
-    context->height = ve->height;
+	context = (AVHWFramesContext*)result->data;
+	context->format = AV_PIX_FMT_D3D11;
+	context->sw_format = software_format;
+	context->width = ve->width;
+	context->height = ve->height;
 
-    /*
-     * D3D11 hardware frames are texture-array slices. The fixed pool lets the
-     * encoder retain a frame without retaining Unity's render target.
-     */
-    context->initial_pool_size = 16;
+	/*
+	 * D3D11 hardware frames are texture-array slices. The fixed pool lets the
+	 * encoder retain a frame without retaining Unity's render target.
+	 */
+	context->initial_pool_size = 16;
 
-    ret = av_hwframe_ctx_init(result);
-    if (ret < 0)
-    {
-        av_buffer_unref(&result);
-        return ret;
-    }
+	ret = av_hwframe_ctx_init(result);
+	if (ret < 0)
+	{
+		av_buffer_unref(&result);
+		return ret;
+	}
 
-    *frames = result;
-    return 0;
+	*frames = result;
+	return 0;
 }
 
 static void set_codec_options(
-    const EncoderCandidate* candidate,
-    AVDictionary** options)
+	const EncoderCandidate* candidate,
+	AVDictionary** options)
 {
-    if (strcmp(candidate->name, "libx264") == 0)
-    {
-        av_dict_set(options, "preset", "veryfast", 0);
-        av_dict_set(options, "tune", "zerolatency", 0);
-    }
-    else if (strcmp(candidate->name, "h264_mf") == 0)
-    {
-        av_dict_set(options, "hw_encoding", "1", 0);
-    }
-    else if (strcmp(candidate->name, "h264_nvenc") == 0)
-    {
-        av_dict_set(options, "delay", "0", 0);
-        av_dict_set(options, "zerolatency", "1", 0);
-    }
+	if (strcmp(candidate->name, "libx264") == 0)
+	{
+		av_dict_set(options, "preset", "veryfast", 0);
+		av_dict_set(options, "tune", "zerolatency", 0);
+	}
+	else if (strcmp(candidate->name, "h264_mf") == 0)
+	{
+		av_dict_set(options, "hw_encoding", "1", 0);
+	}
+	else if (strcmp(candidate->name, "h264_nvenc") == 0)
+	{
+		av_dict_set(options, "delay", "0", 0);
+		av_dict_set(options, "zerolatency", "1", 0);
+	}
 }
 
 static int try_open_encoder(
-    VideoEncoder* ve,
-    const EncoderCandidate* candidate)
+	VideoEncoder* ve,
+	const EncoderCandidate* candidate)
 {
-    const AVCodec* codec;
-    AVCodecContext* context = NULL;
-    AVBufferRef* frames = NULL;
-    AVDictionary* options = NULL;
-    int ret;
+	const AVCodec* codec;
+	AVCodecContext* context = NULL;
+	AVBufferRef* frames = NULL;
+	AVDictionary* options = NULL;
+	int ret;
 
-    codec = avcodec_find_encoder_by_name(candidate->name);
-    if (!codec)
-        return AVERROR_ENCODER_NOT_FOUND;
+	codec = avcodec_find_encoder_by_name(candidate->name);
+	if (!codec)
+		return AVERROR_ENCODER_NOT_FOUND;
 
-    context = avcodec_alloc_context3(codec);
-    if (!context)
-        return AVERROR(ENOMEM);
+	context = avcodec_alloc_context3(codec);
+	if (!context)
+		return AVERROR(ENOMEM);
 
-    context->bit_rate = ve->bit_rate;
-    context->width = ve->width;
-    context->height = ve->height;
-    context->framerate = (AVRational){ ve->fps, 1 };
-    context->time_base = (AVRational){ 1, ve->fps };
-    context->gop_size = ve->fps;
-    context->max_b_frames = 0;
-    context->flags |= AV_CODEC_FLAG_LOW_DELAY;
-    context->pix_fmt = candidate->direct_d3d11
-        ? AV_PIX_FMT_D3D11
-        : candidate->input_format;
-    context->color_range = AVCOL_RANGE_MPEG;
+	context->bit_rate = ve->bit_rate;
+	context->width = ve->width;
+	context->height = ve->height;
+	context->framerate = (AVRational){ ve->fps, 1 };
+	context->time_base = (AVRational){ 1, ve->fps };
+	context->gop_size = ve->fps;
+	context->max_b_frames = 0;
+	context->flags |= AV_CODEC_FLAG_LOW_DELAY;
+	context->pix_fmt = candidate->direct_d3d11
+		? AV_PIX_FMT_D3D11
+		: candidate->input_format;
+	context->color_range = AVCOL_RANGE_MPEG;
 
-    if (ve->height >= 720)
-    {
-        context->colorspace = AVCOL_SPC_BT709;
-        context->color_primaries = AVCOL_PRI_BT709;
-        context->color_trc = AVCOL_TRC_BT709;
-    }
-    else
-    {
-        context->colorspace = AVCOL_SPC_SMPTE170M;
-        context->color_primaries = AVCOL_PRI_SMPTE170M;
-        context->color_trc = AVCOL_TRC_SMPTE170M;
-    }
+	if (ve->height >= 720)
+	{
+		context->colorspace = AVCOL_SPC_BT709;
+		context->color_primaries = AVCOL_PRI_BT709;
+		context->color_trc = AVCOL_TRC_BT709;
+	}
+	else
+	{
+		context->colorspace = AVCOL_SPC_SMPTE170M;
+		context->color_primaries = AVCOL_PRI_SMPTE170M;
+		context->color_trc = AVCOL_TRC_SMPTE170M;
+	}
 
-    if (ve->format->oformat->flags & AVFMT_GLOBALHEADER)
-        context->flags |= AV_CODEC_FLAG_GLOBAL_HEADER;
+	if (ve->format->oformat->flags & AVFMT_GLOBALHEADER)
+		context->flags |= AV_CODEC_FLAG_GLOBAL_HEADER;
 
-    if (candidate->direct_d3d11)
-    {
-        ret = create_hw_frames(ve, candidate->input_format, &frames);
-        if (ret < 0)
-            goto fail;
+	if (candidate->direct_d3d11)
+	{
+		ret = create_hw_frames(ve, candidate->input_format, &frames);
+		if (ret < 0)
+			goto fail;
 
-        context->hw_frames_ctx = av_buffer_ref(frames);
-        if (!context->hw_frames_ctx)
-        {
-            ret = AVERROR(ENOMEM);
-            goto fail;
-        }
-    }
+		context->hw_frames_ctx = av_buffer_ref(frames);
+		if (!context->hw_frames_ctx)
+		{
+			ret = AVERROR(ENOMEM);
+			goto fail;
+		}
+	}
 
-    set_codec_options(candidate, &options);
-    ret = avcodec_open2(context, codec, &options);
-    av_dict_free(&options);
-    if (ret < 0)
-        goto fail;
+	set_codec_options(candidate, &options);
+	ret = avcodec_open2(context, codec, &options);
+	av_dict_free(&options);
+	if (ret < 0)
+		goto fail;
 
-    ve->ctx = context;
-    ve->hw_frames = frames;
-    ve->input_format = candidate->input_format;
-    ve->direct_d3d11 = candidate->direct_d3d11;
-    av_log(
-        NULL,
-        AV_LOG_INFO,
-        "RenderingOut: selected %s (%s, input=%s)\n",
-        candidate->name,
-        candidate->direct_d3d11 ? "D3D11" : "readback",
-        av_get_pix_fmt_name(candidate->input_format));
-    return 0;
+	ve->ctx = context;
+	ve->hw_frames = frames;
+	ve->input_format = candidate->input_format;
+	ve->direct_d3d11 = candidate->direct_d3d11;
+	av_log(
+		NULL,
+		AV_LOG_INFO,
+		"RenderingOut: selected %s (%s, input=%s)\n",
+		candidate->name,
+		candidate->direct_d3d11 ? "D3D11" : "readback",
+		av_get_pix_fmt_name(candidate->input_format));
+	return 0;
 
 fail:
-    av_dict_free(&options);
-    av_buffer_unref(&frames);
-    avcodec_free_context(&context);
-    return ret;
+	av_dict_free(&options);
+	av_buffer_unref(&frames);
+	avcodec_free_context(&context);
+	return ret;
 }
 
 static int initialize_encoder(
-    VideoEncoder* ve,
-    enum AVPixelFormat texture_format,
-    int multisampled)
+	VideoEncoder* ve,
+	enum AVPixelFormat texture_format,
+	int multisampled)
 {
-    EncoderCandidate candidates[8];
-    int candidate_count = 0;
-    int i;
-    int last_error = AVERROR_ENCODER_NOT_FOUND;
+	EncoderCandidate candidates[8];
+	int candidate_count = 0;
+	int i;
+	int last_error = AVERROR_ENCODER_NOT_FOUND;
 
-    if (!multisampled)
-    {
-        candidates[candidate_count++] =
-            (EncoderCandidate){ "h264_nvenc", texture_format, 1 };
-        if (texture_format == AV_PIX_FMT_NV12)
-            candidates[candidate_count++] =
-                (EncoderCandidate){ "h264_mf", AV_PIX_FMT_NV12, 1 };
-    }
+	if (!multisampled)
+	{
+		candidates[candidate_count++] =
+			(EncoderCandidate){ "h264_nvenc", texture_format, 1 };
+		if (texture_format == AV_PIX_FMT_NV12)
+			candidates[candidate_count++] =
+			(EncoderCandidate){ "h264_mf", AV_PIX_FMT_NV12, 1 };
+	}
 
-    candidates[candidate_count++] =
-        (EncoderCandidate){ "h264_nvenc", texture_format, 0 };
-    candidates[candidate_count++] =
-        (EncoderCandidate){ "h264_mf", AV_PIX_FMT_NV12, 0 };
-    candidates[candidate_count++] =
-        (EncoderCandidate){ "h264_amf", AV_PIX_FMT_NV12, 0 };
-    candidates[candidate_count++] =
-        (EncoderCandidate){ "h264_qsv", AV_PIX_FMT_NV12, 0 };
-    candidates[candidate_count++] =
-        (EncoderCandidate){ "libx264", AV_PIX_FMT_NV12, 0 };
+	candidates[candidate_count++] =
+		(EncoderCandidate){ "h264_nvenc", texture_format, 0 };
+	candidates[candidate_count++] =
+		(EncoderCandidate){ "h264_mf", AV_PIX_FMT_NV12, 0 };
+	candidates[candidate_count++] =
+		(EncoderCandidate){ "h264_amf", AV_PIX_FMT_NV12, 0 };
+	candidates[candidate_count++] =
+		(EncoderCandidate){ "h264_qsv", AV_PIX_FMT_NV12, 0 };
+	candidates[candidate_count++] =
+		(EncoderCandidate){ "libx264", AV_PIX_FMT_NV12, 0 };
 
-    for (i = 0; i < candidate_count; ++i)
-    {
-        last_error = try_open_encoder(ve, &candidates[i]);
-        if (last_error >= 0)
-        {
-            ve->initialized = 1;
-            ve->texture_format = texture_format;
-            return 0;
-        }
-    }
+	for (i = 0; i < candidate_count; ++i)
+	{
+		last_error = try_open_encoder(ve, &candidates[i]);
+		if (last_error >= 0)
+		{
+			ve->initialized = 1;
+			ve->texture_format = texture_format;
+			return 0;
+		}
+	}
 
-    return last_error;
+	return last_error;
+}
+
+static int initialize_audio_stream(VideoEncoder* ve)
+{
+	const AVCodec* codec;
+	AVCodecContext* ctx = NULL;
+	AVStream* stream = NULL;
+	AVFrame* frame = NULL;
+	int ret;
+
+	/*
+	 * AAC is the safe default for mp4/mov/webm/matroska. If the container
+	 * cannot hold AAC the audio track is silently skipped, leaving a
+	 * video-only file.
+	 */
+	codec = avcodec_find_encoder_by_name("aac");
+	if (!codec)
+		return AVERROR_ENCODER_NOT_FOUND;
+
+	stream = avformat_new_stream(ve->format, codec);
+	if (!stream)
+		return AVERROR(ENOMEM);
+
+	ctx = avcodec_alloc_context3(codec);
+	if (!ctx)
+	{
+		ret = AVERROR(ENOMEM);
+		goto fail;
+	}
+
+	ctx->bit_rate = 128000;
+	ctx->sample_rate = 44100;
+	ctx->ch_layout = (AVChannelLayout)AV_CHANNEL_LAYOUT_STEREO;
+	ctx->time_base = (AVRational){ 1, ctx->sample_rate };
+	ctx->sample_fmt = codec->sample_fmts
+		? codec->sample_fmts[0]
+		: AV_SAMPLE_FMT_FLTP;
+
+	if (ve->format->oformat->flags & AVFMT_GLOBALHEADER)
+		ctx->flags |= AV_CODEC_FLAG_GLOBAL_HEADER;
+
+	ret = avcodec_open2(ctx, codec, NULL);
+	if (ret < 0)
+		goto fail;
+
+	frame = av_frame_alloc();
+	if (!frame)
+	{
+		ret = AVERROR(ENOMEM);
+		goto fail;
+	}
+	frame->format = ctx->sample_fmt;
+	frame->sample_rate = ctx->sample_rate;
+	av_channel_layout_copy(&frame->ch_layout, &ctx->ch_layout);
+	frame->nb_samples = ctx->frame_size > 0 ? ctx->frame_size : 1024;
+	ret = av_frame_get_buffer(frame, 0);
+	if (ret < 0)
+		goto fail;
+
+	ret = avcodec_parameters_from_context(stream->codecpar, ctx);
+	if (ret < 0)
+		goto fail;
+	stream->time_base = ctx->time_base;
+
+	ve->audio_ctx = ctx;
+	ve->audio_stream = stream;
+	ve->audio_frame = frame;
+	ve->audio_enabled = 1;
+	av_log(
+		NULL,
+		AV_LOG_INFO,
+		"RenderingOut: audio stream initialized (aac, %d Hz, %d ch, %d samples/frame)\n",
+		ctx->sample_rate,
+		ctx->ch_layout.nb_channels,
+		frame->nb_samples);
+	return 0;
+
+fail:
+	av_frame_free(&frame);
+	avcodec_free_context(&ctx);
+	return ret;
 }
 
 static int initialize_output(VideoEncoder* ve)
 {
-    AVDictionary* options = NULL;
-    int ret;
+	AVDictionary* options = NULL;
+	int ret;
 
-    ve->stream = avformat_new_stream(ve->format, NULL);
-    if (!ve->stream)
-        return AVERROR(ENOMEM);
+	ve->stream = avformat_new_stream(ve->format, NULL);
+	if (!ve->stream)
+		return AVERROR(ENOMEM);
 
-    ve->stream->time_base = ve->ctx->time_base;
-    ve->stream->avg_frame_rate = ve->ctx->framerate;
-    ret = avcodec_parameters_from_context(ve->stream->codecpar, ve->ctx);
-    if (ret < 0)
-        return ret;
+	ve->stream->time_base = ve->ctx->time_base;
+	ve->stream->avg_frame_rate = ve->ctx->framerate;
+	ret = avcodec_parameters_from_context(ve->stream->codecpar, ve->ctx);
+	if (ret < 0)
+		return ret;
 
-    if (!(ve->format->oformat->flags & AVFMT_NOFILE))
-    {
-        ret = avio_open(&ve->format->pb, ve->filename, AVIO_FLAG_WRITE);
-        if (ret < 0)
-            return ret;
-    }
+	/*
+	 * Audio is set up before the header is written so the stream appears in
+	 * the file header. Failure here only disables the audio track; video
+	 * still works.
+	 */
+	ret = initialize_audio_stream(ve);
+	if (ret < 0)
+	{
+		av_log(
+			NULL,
+			AV_LOG_WARNING,
+			"RenderingOut: audio stream init failed (%s), video-only\n",
+			av_err2str(ret));
+		ve->audio_enabled = 0;
+	}
 
-    if (strcmp(ve->format->oformat->name, "mp4") == 0 ||
-        strcmp(ve->format->oformat->name, "mov") == 0)
-        av_dict_set(&options, "movflags", "+faststart", 0);
+	if (!(ve->format->oformat->flags & AVFMT_NOFILE))
+	{
+		ret = avio_open(&ve->format->pb, ve->filename, AVIO_FLAG_WRITE);
+		if (ret < 0)
+			return ret;
+	}
 
-    ret = avformat_write_header(ve->format, &options);
-    av_dict_free(&options);
-    if (ret < 0)
-        return ret;
+	if (strcmp(ve->format->oformat->name, "mp4") == 0 ||
+		strcmp(ve->format->oformat->name, "mov") == 0)
+		av_dict_set(&options, "movflags", "+faststart", 0);
 
-    ve->header_written = 1;
-    return 0;
+	ret = avformat_write_header(ve->format, &options);
+	av_dict_free(&options);
+	if (ret < 0)
+		return ret;
+
+	ve->header_written = 1;
+	return 0;
 }
 
 static int send_frame_and_write_packets(VideoEncoder* ve, AVFrame* frame)
 {
-    int ret;
+	int ret;
 
-    ret = avcodec_send_frame(ve->ctx, frame);
-    if (ret == AVERROR(EAGAIN))
-    {
-        ret = write_available_packets(ve);
-        if (ret < 0)
-            return ret;
-        ret = avcodec_send_frame(ve->ctx, frame);
-    }
-    if (ret < 0)
-        return ret;
+	ret = avcodec_send_frame(ve->ctx, frame);
+	if (ret == AVERROR(EAGAIN))
+	{
+		ret = write_available_packets(ve, ve->ctx, ve->stream);
+		if (ret < 0)
+			return ret;
+		ret = avcodec_send_frame(ve->ctx, frame);
+	}
+	if (ret < 0)
+		return ret;
 
-    return write_available_packets(ve);
+	return write_available_packets(ve, ve->ctx, ve->stream);
 }
 
 static int flush_encoder(VideoEncoder* ve)
 {
-    int ret;
+	int ret;
 
-    if (!ve->initialized || !ve->header_written)
-        return 0;
+	if (!ve->initialized || !ve->header_written)
+		return 0;
 
-    ret = avcodec_send_frame(ve->ctx, NULL);
-    if (ret == AVERROR(EAGAIN))
-    {
-        ret = write_available_packets(ve);
-        if (ret < 0)
-            return ret;
-        ret = avcodec_send_frame(ve->ctx, NULL);
-    }
-    if (ret < 0 && ret != AVERROR_EOF)
-        return ret;
+	ret = avcodec_send_frame(ve->ctx, NULL);
+	if (ret == AVERROR(EAGAIN))
+	{
+		ret = write_available_packets(ve, ve->ctx, ve->stream);
+		if (ret < 0)
+			return ret;
+		ret = avcodec_send_frame(ve->ctx, NULL);
+	}
+	if (ret < 0 && ret != AVERROR_EOF)
+		return ret;
 
-    return write_available_packets(ve);
+	return write_available_packets(ve, ve->ctx, ve->stream);
+}
+
+static int write_audio_frame(VideoEncoder* ve)
+{
+	int ret;
+
+	ve->audio_frame->pts = ve->audio_next_pts;
+	ve->audio_next_pts += ve->audio_frame->nb_samples;
+
+	ret = avcodec_send_frame(ve->audio_ctx, ve->audio_frame);
+	if (ret == AVERROR(EAGAIN))
+	{
+		ret = write_available_packets(ve, ve->audio_ctx, ve->audio_stream);
+		if (ret < 0)
+			return ret;
+		ret = avcodec_send_frame(ve->audio_ctx, ve->audio_frame);
+	}
+	if (ret < 0)
+		return ret;
+
+	return write_available_packets(ve, ve->audio_ctx, ve->audio_stream);
+}
+
+static int flush_audio_encoder(VideoEncoder* ve)
+{
+	int ret;
+
+	if (!ve->audio_enabled || !ve->audio_ctx || !ve->audio_stream)
+		return 0;
+
+	ret = avcodec_send_frame(ve->audio_ctx, NULL);
+	if (ret == AVERROR(EAGAIN))
+	{
+		ret = write_available_packets(ve, ve->audio_ctx, ve->audio_stream);
+		if (ret < 0)
+			return ret;
+		ret = avcodec_send_frame(ve->audio_ctx, NULL);
+	}
+	if (ret < 0 && ret != AVERROR_EOF)
+		return ret;
+
+	return write_available_packets(ve, ve->audio_ctx, ve->audio_stream);
+}
+
+/*
+ * Resamples interleaved S16 PCM samples from the Unity caller into the
+ * encoder's frame format (FLTP, stereo, 44100 Hz) and writes them to the
+ * audio encoder. Uses an internal converter frame of encoder's frame_size;
+ * swr_convert handles any leftover samples through its internal buffering.
+ * If the source is shorter than the video the caller pads the remainder
+ * with silence.
+ */
+static int write_audio_from_pcm(
+	VideoEncoder* ve,
+	const uint8_t* pcm_data,
+	int64_t pcm_size,
+	int sample_rate,
+	int channels)
+{
+	SwrContext* resampler = NULL;
+	AVFrame* converted = NULL;
+	AVChannelLayout src_layout = { 0 };
+	int frame_size;
+	int src_bytes_per_sample;
+	int64_t src_total_samples;
+	int64_t src_offset;
+	int ret;
+
+	if (!pcm_data || pcm_size <= 0 || sample_rate <= 0 ||
+		channels <= 0 || channels > AV_NUM_DATA_POINTERS)
+		return AVERROR(EINVAL);
+
+	src_bytes_per_sample = channels * sizeof(int16_t);
+	src_total_samples = pcm_size / src_bytes_per_sample;
+	if (src_total_samples <= 0)
+		return AVERROR(EINVAL);
+
+	av_channel_layout_default(&src_layout, channels);
+
+	ret = swr_alloc_set_opts2(
+		&resampler,
+		&ve->audio_ctx->ch_layout,
+		ve->audio_ctx->sample_fmt,
+		ve->audio_ctx->sample_rate,
+		&src_layout,
+		AV_SAMPLE_FMT_S16,
+		sample_rate,
+		0, NULL);
+	if (ret < 0)
+		goto fail;
+	ret = swr_init(resampler);
+	if (ret < 0)
+		goto fail;
+
+	frame_size = ve->audio_ctx->frame_size > 0
+		? ve->audio_ctx->frame_size
+		: 1024;
+
+	converted = av_frame_alloc();
+	if (!converted)
+	{
+		ret = AVERROR(ENOMEM);
+		goto fail;
+	}
+
+	src_offset = 0;
+	while (src_offset < src_total_samples)
+	{
+		int64_t chunk = src_total_samples - src_offset;
+		if (chunk > frame_size)
+			chunk = frame_size;
+		int in_samples = (int)chunk;
+
+		av_frame_unref(converted);
+		converted->format = ve->audio_ctx->sample_fmt;
+		converted->sample_rate = ve->audio_ctx->sample_rate;
+		av_channel_layout_copy(&converted->ch_layout, &ve->audio_ctx->ch_layout);
+		converted->nb_samples = frame_size;
+
+		ret = av_frame_get_buffer(converted, 0);
+		if (ret < 0)
+			goto fail;
+
+		const uint8_t* src_ptr = pcm_data +
+			src_offset * src_bytes_per_sample;
+		ret = swr_convert(
+			resampler,
+			converted->data,
+			frame_size,
+			&src_ptr,
+			in_samples);
+		if (ret < 0)
+			goto fail;
+
+		src_offset += in_samples;
+
+		if (ret == 0)
+		{
+			av_frame_unref(converted);
+			continue;
+		}
+
+		converted->nb_samples = ret;
+		converted->pts = ve->audio_next_pts;
+		ve->audio_next_pts += ret;
+
+		ret = avcodec_send_frame(ve->audio_ctx, converted);
+		if (ret == AVERROR(EAGAIN))
+		{
+			ret = write_available_packets(ve, ve->audio_ctx, ve->audio_stream);
+			if (ret < 0)
+				goto fail;
+			ret = avcodec_send_frame(ve->audio_ctx, converted);
+		}
+		if (ret < 0)
+			goto fail;
+
+		ret = write_available_packets(ve, ve->audio_ctx, ve->audio_stream);
+		if (ret < 0)
+			goto fail;
+
+		av_frame_unref(converted);
+	}
+
+	/*
+	 * Flush any samples swr_convert buffered internally so they are not lost
+	 * before the silence padding runs.
+	 */
+	for (;;)
+	{
+		av_frame_unref(converted);
+		converted->format = ve->audio_ctx->sample_fmt;
+		converted->sample_rate = ve->audio_ctx->sample_rate;
+		av_channel_layout_copy(&converted->ch_layout, &ve->audio_ctx->ch_layout);
+		converted->nb_samples = frame_size;
+
+		ret = av_frame_get_buffer(converted, 0);
+		if (ret < 0)
+			goto fail;
+
+		ret = swr_convert(
+			resampler,
+			converted->data,
+			frame_size,
+			NULL,
+			0);
+		if (ret < 0)
+			goto fail;
+		if (ret == 0)
+		{
+			av_frame_unref(converted);
+			break;
+		}
+
+		converted->nb_samples = ret;
+		converted->pts = ve->audio_next_pts;
+		ve->audio_next_pts += ret;
+
+		ret = avcodec_send_frame(ve->audio_ctx, converted);
+		if (ret == AVERROR(EAGAIN))
+		{
+			ret = write_available_packets(ve, ve->audio_ctx, ve->audio_stream);
+			if (ret < 0)
+				goto fail;
+			ret = avcodec_send_frame(ve->audio_ctx, converted);
+		}
+		if (ret < 0)
+			goto fail;
+
+		ret = write_available_packets(ve, ve->audio_ctx, ve->audio_stream);
+		if (ret < 0)
+			goto fail;
+
+		av_frame_unref(converted);
+	}
+
+	ret = 0;
+
+fail:
+	av_frame_free(&converted);
+	swr_free(&resampler);
+	av_channel_layout_uninit(&src_layout);
+	return ret;
+}
+
+/*
+ * Writes silent audio frames until the audio timeline reaches the video
+ * timeline. Used when no audio source was registered (or as padding after
+ * a short source). Silent AAC packets are essentially free in size.
+ */
+static int write_silence_until_pts(VideoEncoder* ve, int64_t target_pts)
+{
+	int ret;
+
+	while (ve->audio_next_pts < target_pts)
+	{
+		av_samples_set_silence(
+			ve->audio_frame->data,
+			0,
+			ve->audio_frame->nb_samples,
+			ve->audio_ctx->ch_layout.nb_channels,
+			ve->audio_ctx->sample_fmt);
+
+		ret = write_audio_frame(ve);
+		if (ret < 0)
+			return ret;
+	}
+	return 0;
 }
 
 static int finish_encoding(VideoEncoder* ve)
 {
-    int result = 0;
-    int ret;
+	int result = 0;
+	int ret;
 
-    ret = flush_encoder(ve);
-    if (ret < 0)
-        result = ret;
+	ret = flush_encoder(ve);
+	if (ret < 0)
+		result = ret;
 
-    if (ve->header_written)
-    {
-        ret = av_write_trailer(ve->format);
-        if (ret < 0 && result >= 0)
-            result = ret;
-        ve->header_written = 0;
-    }
+	if (ve->audio_enabled && ve->audio_ctx && result >= 0)
+	{
+		/*
+		 * Video duration in encoder time_base is next_pts * time_base.
+		 * Convert to audio time_base (1/sample_rate) for the silence target.
+		 */
+		int64_t video_duration_samples = av_rescale_q(
+			ve->next_pts,
+			ve->ctx->time_base,
+			ve->audio_ctx->time_base);
 
-    if (ve->format && ve->format->pb &&
-        !(ve->format->oformat->flags & AVFMT_NOFILE))
-    {
-        ret = avio_closep(&ve->format->pb);
-        if (ret < 0 && result >= 0)
-            result = ret;
-    }
+		if (ve->pending_pcm_data)
+		{
+			ret = write_audio_from_pcm(
+				ve,
+				ve->pending_pcm_data,
+				ve->pending_pcm_size,
+				ve->pending_pcm_sample_rate,
+				ve->pending_pcm_channels);
+			if (ret < 0)
+			{
+				av_log(
+					NULL,
+					AV_LOG_WARNING,
+					"RenderingOut: audio mux failed (%s), padding silence\n",
+					av_err2str(ret));
+				ve->audio_next_pts = 0;
+			}
+		}
 
-    avcodec_free_context(&ve->ctx);
-    avformat_free_context(ve->format);
-    ve->format = NULL;
-    ve->stream = NULL;
-    ve->initialized = 0;
-    return result;
+		ret = write_silence_until_pts(ve, video_duration_samples);
+		if (ret < 0 && result >= 0)
+			result = ret;
+
+		ret = flush_audio_encoder(ve);
+		if (ret < 0 && result >= 0)
+			result = ret;
+	}
+
+	if (ve->header_written)
+	{
+		ret = av_write_trailer(ve->format);
+		if (ret < 0 && result >= 0)
+			result = ret;
+		ve->header_written = 0;
+	}
+
+	if (ve->format && ve->format->pb &&
+		!(ve->format->oformat->flags & AVFMT_NOFILE))
+	{
+		ret = avio_closep(&ve->format->pb);
+		if (ret < 0 && result >= 0)
+			result = ret;
+	}
+
+	avcodec_free_context(&ve->ctx);
+	avcodec_free_context(&ve->audio_ctx);
+	av_frame_free(&ve->audio_frame);
+	av_freep(&ve->pending_pcm_data);
+	ve->pending_pcm_size = 0;
+	ve->pending_pcm_sample_rate = 0;
+	ve->pending_pcm_channels = 0;
+	avformat_free_context(ve->format);
+	ve->format = NULL;
+	ve->stream = NULL;
+	ve->audio_stream = NULL;
+	ve->audio_enabled = 0;
+	ve->initialized = 0;
+	return result;
 }
 
 static unsigned __stdcall encoder_worker_main(void* parameter)
 {
-    VideoEncoder* ve = (VideoEncoder*)parameter;
-    HRESULT com_result;
-    int com_initialized;
-    int should_exit = 0;
+	VideoEncoder* ve = (VideoEncoder*)parameter;
+	HRESULT com_result;
+	int com_initialized;
+	int should_exit = 0;
 
-    /*
-     * Unity's main thread is STA. Media Foundation requires MTA, so every
-     * encoder operation, including close, stays on this dedicated MTA thread.
-     */
-    com_result = CoInitializeEx(NULL, COINIT_MULTITHREADED);
-    com_initialized = SUCCEEDED(com_result);
+	/*
+	 * Unity's main thread is STA. Media Foundation requires MTA, so every
+	 * encoder operation, including close, stays on this dedicated MTA thread.
+	 */
+	com_result = CoInitializeEx(NULL, COINIT_MULTITHREADED);
+	com_initialized = SUCCEEDED(com_result);
 
-    while (!should_exit)
-    {
-        EncoderWorkerCommand command;
-        AVFrame* frame;
-        enum AVPixelFormat texture_format;
-        int multisampled;
-        int result = 0;
+	while (!should_exit)
+	{
+		EncoderWorkerCommand command;
+		AVFrame* frame;
+		enum AVPixelFormat texture_format;
+		int multisampled;
+		int result = 0;
 
-        EnterCriticalSection(&ve->worker_lock);
-        while (ve->worker_command == ENCODER_COMMAND_NONE)
-            SleepConditionVariableCS(
-                &ve->worker_changed, &ve->worker_lock, INFINITE);
+		EnterCriticalSection(&ve->worker_lock);
+		while (ve->worker_command == ENCODER_COMMAND_NONE)
+			SleepConditionVariableCS(
+				&ve->worker_changed, &ve->worker_lock, INFINITE);
 
-        command = ve->worker_command;
-        frame = ve->worker_frame;
-        texture_format = ve->worker_texture_format;
-        multisampled = ve->worker_multisampled;
-        LeaveCriticalSection(&ve->worker_lock);
+		command = ve->worker_command;
+		frame = ve->worker_frame;
+		texture_format = ve->worker_texture_format;
+		multisampled = ve->worker_multisampled;
+		LeaveCriticalSection(&ve->worker_lock);
 
-        switch (command)
-        {
-        case ENCODER_COMMAND_INITIALIZE:
-            result = initialize_encoder(
-                ve, texture_format, multisampled);
-            if (result >= 0)
-                result = initialize_output(ve);
-            if (result < 0)
-                ve->fatal_error = result;
-            break;
+		switch (command)
+		{
+		case ENCODER_COMMAND_INITIALIZE:
+			result = initialize_encoder(
+				ve, texture_format, multisampled);
+			if (result >= 0)
+				result = initialize_output(ve);
+			if (result < 0)
+				ve->fatal_error = result;
+			break;
 
-        case ENCODER_COMMAND_ENCODE:
-            result = send_frame_and_write_packets(ve, frame);
-            av_frame_free(&frame);
-            if (result < 0)
-                ve->fatal_error = result;
-            break;
+		case ENCODER_COMMAND_ENCODE:
+			result = send_frame_and_write_packets(ve, frame);
+			av_frame_free(&frame);
+			if (result < 0)
+				ve->fatal_error = result;
+			break;
 
-        case ENCODER_COMMAND_FINISH:
-            result = finish_encoding(ve);
-            break;
+		case ENCODER_COMMAND_FINISH:
+			result = finish_encoding(ve);
+			break;
 
-        case ENCODER_COMMAND_EXIT:
-            should_exit = 1;
-            break;
+		case ENCODER_COMMAND_EXIT:
+			should_exit = 1;
+			break;
 
-        case ENCODER_COMMAND_NONE:
-        default:
-            result = AVERROR(EINVAL);
-            break;
-        }
+		case ENCODER_COMMAND_NONE:
+		default:
+			result = AVERROR(EINVAL);
+			break;
+		}
 
-        EnterCriticalSection(&ve->worker_lock);
-        ve->worker_frame = NULL;
-        ve->worker_result = result;
-        ve->worker_command = ENCODER_COMMAND_NONE;
-        WakeAllConditionVariable(&ve->worker_changed);
-        LeaveCriticalSection(&ve->worker_lock);
-    }
+		EnterCriticalSection(&ve->worker_lock);
+		ve->worker_frame = NULL;
+		ve->worker_result = result;
+		ve->worker_command = ENCODER_COMMAND_NONE;
+		WakeAllConditionVariable(&ve->worker_changed);
+		LeaveCriticalSection(&ve->worker_lock);
+	}
 
-    if (com_initialized)
-        CoUninitialize();
-    return 0;
+	if (com_initialized)
+		CoUninitialize();
+	return 0;
 }
 
 static int dispatch_worker_command(
-    VideoEncoder* ve,
-    EncoderWorkerCommand command,
-    AVFrame* frame,
-    enum AVPixelFormat texture_format,
-    int multisampled)
+	VideoEncoder* ve,
+	EncoderWorkerCommand command,
+	AVFrame* frame,
+	enum AVPixelFormat texture_format,
+	int multisampled)
 {
-    int result;
+	int result;
 
-    if (!ve->worker)
-        return AVERROR(EINVAL);
+	if (!ve->worker)
+		return AVERROR(EINVAL);
 
-    EnterCriticalSection(&ve->worker_lock);
-    while (ve->worker_command != ENCODER_COMMAND_NONE)
-        SleepConditionVariableCS(
-            &ve->worker_changed, &ve->worker_lock, INFINITE);
+	EnterCriticalSection(&ve->worker_lock);
+	while (ve->worker_command != ENCODER_COMMAND_NONE)
+		SleepConditionVariableCS(
+			&ve->worker_changed, &ve->worker_lock, INFINITE);
 
-    ve->worker_frame = frame;
-    ve->worker_texture_format = texture_format;
-    ve->worker_multisampled = multisampled;
-    ve->worker_command = command;
-    WakeAllConditionVariable(&ve->worker_changed);
+	ve->worker_frame = frame;
+	ve->worker_texture_format = texture_format;
+	ve->worker_multisampled = multisampled;
+	ve->worker_command = command;
+	WakeAllConditionVariable(&ve->worker_changed);
 
-    while (ve->worker_command != ENCODER_COMMAND_NONE)
-        SleepConditionVariableCS(
-            &ve->worker_changed, &ve->worker_lock, INFINITE);
+	while (ve->worker_command != ENCODER_COMMAND_NONE)
+		SleepConditionVariableCS(
+			&ve->worker_changed, &ve->worker_lock, INFINITE);
 
-    result = ve->worker_result;
-    LeaveCriticalSection(&ve->worker_lock);
-    return result;
+	result = ve->worker_result;
+	LeaveCriticalSection(&ve->worker_lock);
+	return result;
 }
 
 UNITY_INTERFACE_EXPORT VideoEncoder* UNITY_INTERFACE_API
 video_encoder_create(
-    int bit_rate,
-    int width,
-    int height,
-    int fps,
-    const char* filename)
+	int bit_rate,
+	int width,
+	int height,
+	int fps,
+	const char* filename)
 {
-    VideoEncoder* ve;
-    int ret;
+	VideoEncoder* ve;
+	int ret;
 
-    if (bit_rate <= 0 || width <= 0 || height <= 0 || fps <= 0 ||
-        !filename || (width & 1) || (height & 1))
-        return NULL;
-    if (!renderingout_get_hw_device())
-        return NULL;
+	if (bit_rate <= 0 || width <= 0 || height <= 0 || fps <= 0 ||
+		!filename || (width & 1) || (height & 1))
+		return NULL;
+	if (!renderingout_get_hw_device())
+		return NULL;
 
-    ve = (VideoEncoder*)calloc(1, sizeof(*ve));
-    if (!ve)
-        return NULL;
+	ve = (VideoEncoder*)calloc(1, sizeof(*ve));
+	if (!ve)
+		return NULL;
 
-    ve->bit_rate = bit_rate;
-    ve->width = width;
-    ve->height = height;
-    ve->fps = fps;
-    ve->filename = av_strdup(filename);
-    if (!ve->filename)
-        goto fail;
+	ve->bit_rate = bit_rate;
+	ve->width = width;
+	ve->height = height;
+	ve->fps = fps;
+	ve->filename = av_strdup(filename);
+	if (!ve->filename)
+		goto fail;
 
-    ret = avformat_alloc_output_context2(
-        &ve->format, NULL, NULL, filename);
-    if (ret < 0 || !ve->format)
-        goto fail;
+	ret = avformat_alloc_output_context2(
+		&ve->format, NULL, NULL, filename);
+	if (ret < 0 || !ve->format)
+		goto fail;
 
-    ve->packet = av_packet_alloc();
-    if (!ve->packet)
-        goto fail;
+	ve->packet = av_packet_alloc();
+	if (!ve->packet)
+		goto fail;
 
-    ret = d3d11_frame_converter_create(
-        &ve->converter,
-        renderingout_get_hw_device(),
-        width,
-        height);
-    if (ret < 0)
-        goto fail;
+	ret = d3d11_frame_converter_create(
+		&ve->converter,
+		renderingout_get_hw_device(),
+		width,
+		height);
+	if (ret < 0)
+		goto fail;
 
-    InitializeCriticalSection(&ve->worker_lock);
-    InitializeConditionVariable(&ve->worker_changed);
-    ve->worker = (HANDLE)_beginthreadex(
-        NULL, 0, encoder_worker_main, ve, 0, NULL);
-    if (!ve->worker)
-    {
-        DeleteCriticalSection(&ve->worker_lock);
-        goto fail;
-    }
+	InitializeCriticalSection(&ve->worker_lock);
+	InitializeConditionVariable(&ve->worker_changed);
+	ve->worker = (HANDLE)_beginthreadex(
+		NULL, 0, encoder_worker_main, ve, 0, NULL);
+	if (!ve->worker)
+	{
+		DeleteCriticalSection(&ve->worker_lock);
+		goto fail;
+	}
 
-    return ve;
+	return ve;
 
 fail:
-    d3d11_frame_converter_free(&ve->converter);
-    av_packet_free(&ve->packet);
-    avformat_free_context(ve->format);
-    av_freep(&ve->filename);
-    free(ve);
-    return NULL;
+	d3d11_frame_converter_free(&ve->converter);
+	av_packet_free(&ve->packet);
+	avformat_free_context(ve->format);
+	av_freep(&ve->filename);
+	free(ve);
+	return NULL;
 }
 
 UNITY_INTERFACE_EXPORT int UNITY_INTERFACE_API
 video_encoder_submit_frame(VideoEncoder* ve, void* native_texture)
 {
-    ID3D11Resource* resource = (ID3D11Resource*)native_texture;
-    D3D11_TEXTURE2D_DESC desc;
-    enum AVPixelFormat texture_format;
-    AVFrame* frame = NULL;
-    int ret;
+	ID3D11Resource* resource = (ID3D11Resource*)native_texture;
+	D3D11_TEXTURE2D_DESC desc;
+	enum AVPixelFormat texture_format;
+	AVFrame* frame = NULL;
+	int ret;
 
-    if (!ve || !resource)
-        return AVERROR(EINVAL);
-    if (ve->fatal_error < 0)
-        return ve->fatal_error;
+	if (!ve || !resource)
+		return AVERROR(EINVAL);
+	if (ve->fatal_error < 0)
+		return ve->fatal_error;
 
-    ret = d3d11_resource_texture_desc(resource, &desc);
-    if (ret < 0)
-        return ret;
-    if ((int)desc.Width != ve->width || (int)desc.Height != ve->height)
-        return AVERROR(EINVAL);
+	ret = d3d11_resource_texture_desc(resource, &desc);
+	if (ret < 0)
+		return ret;
+	if ((int)desc.Width != ve->width || (int)desc.Height != ve->height)
+		return AVERROR(EINVAL);
 
-    texture_format = d3d11_texture_pixel_format(desc.Format);
-    if (texture_format == AV_PIX_FMT_NONE)
-        return AVERROR(ENOSYS);
+	texture_format = d3d11_texture_pixel_format(desc.Format);
+	if (texture_format == AV_PIX_FMT_NONE)
+		return AVERROR(ENOSYS);
 
-    if (!ve->initialized)
-    {
-        ret = dispatch_worker_command(
-            ve,
-            ENCODER_COMMAND_INITIALIZE,
-            NULL,
-            texture_format,
-            desc.SampleDesc.Count > 1);
-        if (ret < 0)
-            return ret;
-    }
-    else if (texture_format != ve->texture_format)
-    {
-        return AVERROR(EINVAL);
-    }
+	if (!ve->initialized)
+	{
+		ret = dispatch_worker_command(
+			ve,
+			ENCODER_COMMAND_INITIALIZE,
+			NULL,
+			texture_format,
+			desc.SampleDesc.Count > 1);
+		if (ret < 0)
+			return ret;
+	}
+	else if (texture_format != ve->texture_format)
+	{
+		return AVERROR(EINVAL);
+	}
 
-    if (ve->direct_d3d11)
-    {
-        if (desc.SampleDesc.Count != 1)
-            return AVERROR(EINVAL);
-        ret = d3d11_frame_copy_to_hw(
-            ve->converter,
-            ve->hw_frames,
-            resource,
-            ve->next_pts,
-            &frame);
-    }
-    else
-    {
-        ret = d3d11_frame_readback(
-            ve->converter,
-            resource,
-            ve->input_format,
-            ve->next_pts,
-            &frame);
-    }
-    if (ret < 0)
-        return ret;
+	if (ve->direct_d3d11)
+	{
+		if (desc.SampleDesc.Count != 1)
+			return AVERROR(EINVAL);
+		ret = d3d11_frame_copy_to_hw(
+			ve->converter,
+			ve->hw_frames,
+			resource,
+			ve->next_pts,
+			&frame);
+	}
+	else
+	{
+		ret = d3d11_frame_readback(
+			ve->converter,
+			resource,
+			ve->input_format,
+			ve->next_pts,
+			&frame);
+	}
+	if (ret < 0)
+		return ret;
 
-    ret = dispatch_worker_command(
-        ve,
-        ENCODER_COMMAND_ENCODE,
-        frame,
-        AV_PIX_FMT_NONE,
-        0);
-    if (ret >= 0)
-        ++ve->next_pts;
-    return ret;
+	ret = dispatch_worker_command(
+		ve,
+		ENCODER_COMMAND_ENCODE,
+		frame,
+		AV_PIX_FMT_NONE,
+		0);
+	if (ret >= 0)
+		++ve->next_pts;
+	return ret;
+}
+
+UNITY_INTERFACE_EXPORT int UNITY_INTERFACE_API
+video_encoder_mux_audio(
+	VideoEncoder* ve,
+	const void* pcm_data,
+	int pcm_length_bytes,
+	int sample_rate,
+	int channels)
+{
+	uint8_t* copy = NULL;
+
+	if (!ve || !pcm_data || pcm_length_bytes <= 0 ||
+		sample_rate <= 0 || channels <= 0)
+		return AVERROR(EINVAL);
+	if (ve->fatal_error < 0)
+		return ve->fatal_error;
+	if (!ve->audio_enabled)
+		return AVERROR(EINVAL);
+
+	copy = av_malloc(pcm_length_bytes);
+	if (!copy)
+		return AVERROR(ENOMEM);
+	memcpy(copy, pcm_data, pcm_length_bytes);
+
+	/*
+	 * Overwrites any previously registered buffer; the actual encode happens
+	 * during finish_encoding so repeated calls naturally overwrite.
+	 */
+	av_freep(&ve->pending_pcm_data);
+	ve->pending_pcm_data = copy;
+	ve->pending_pcm_size = pcm_length_bytes;
+	ve->pending_pcm_sample_rate = sample_rate;
+	ve->pending_pcm_channels = channels;
+	return 0;
 }
 
 UNITY_INTERFACE_EXPORT void UNITY_INTERFACE_API
 video_encoder_free(VideoEncoder* ve)
 {
-    if (!ve)
-        return;
+	if (!ve)
+		return;
 
-    if (ve->worker)
-    {
-        dispatch_worker_command(
-            ve, ENCODER_COMMAND_FINISH, NULL, AV_PIX_FMT_NONE, 0);
-        dispatch_worker_command(
-            ve, ENCODER_COMMAND_EXIT, NULL, AV_PIX_FMT_NONE, 0);
-        WaitForSingleObject(ve->worker, INFINITE);
-        CloseHandle(ve->worker);
-        ve->worker = NULL;
-        DeleteCriticalSection(&ve->worker_lock);
-    }
+	if (ve->worker)
+	{
+		dispatch_worker_command(
+			ve, ENCODER_COMMAND_FINISH, NULL, AV_PIX_FMT_NONE, 0);
+		dispatch_worker_command(
+			ve, ENCODER_COMMAND_EXIT, NULL, AV_PIX_FMT_NONE, 0);
+		WaitForSingleObject(ve->worker, INFINITE);
+		CloseHandle(ve->worker);
+		ve->worker = NULL;
+		DeleteCriticalSection(&ve->worker_lock);
+	}
 
-    d3d11_frame_converter_free(&ve->converter);
-    av_buffer_unref(&ve->hw_frames);
-    av_packet_free(&ve->packet);
-    av_freep(&ve->filename);
-    free(ve);
+	d3d11_frame_converter_free(&ve->converter);
+	av_buffer_unref(&ve->hw_frames);
+	av_packet_free(&ve->packet);
+	avcodec_free_context(&ve->audio_ctx);
+	av_frame_free(&ve->audio_frame);
+	av_freep(&ve->pending_pcm_data);
+	av_freep(&ve->filename);
+	free(ve);
 }

@@ -28,6 +28,24 @@ video_encoder_submit_frame(
     void* native_texture
 );
 
+/*
+ * Registers a PCM buffer to be muxed into the output when video_encoder_free
+ * is called. The PCM data is resampled and re-encoded to AAC.
+ *
+ * pcm_data:        pointer to interleaved signed 16-bit PCM samples.
+ * pcm_length_bytes: number of bytes pointed to by pcm_data.
+ * sample_rate:     sampling rate in Hz (e.g. 44100).
+ * channels:        number of audio channels (e.g. 2 for stereo).
+ */
+UNITY_INTERFACE_EXPORT int UNITY_INTERFACE_API
+video_encoder_mux_audio(
+    VideoEncoder* ve,
+    const void* pcm_data,
+    int pcm_length_bytes,
+    int sample_rate,
+    int channels
+);
+
 UNITY_INTERFACE_EXPORT void UNITY_INTERFACE_API
 video_encoder_free(
     VideoEncoder* ve

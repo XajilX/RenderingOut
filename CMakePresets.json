@@ -1,11 +1,11 @@
-﻿{
+{
   "version": 3,
   "configurePresets": [
     {
-      "name": "windows-msvc-base",
+      "name": "windows-base",
       "hidden": true,
       "generator": "Ninja",
-      "binaryDir": "${sourceDir}/out/build/msvc-${presetName}",
+      "binaryDir": "${sourceDir}/out/build/${presetName}",
       "installDir": "${sourceDir}/out/install/${presetName}",
       "cacheVariables": {
         "CMAKE_C_COMPILER": "cl.exe",
@@ -24,7 +24,7 @@
     {
       "name": "x64-debug",
       "displayName": "x64 Debug",
-      "inherits": "windows-msvc-base",
+      "inherits": "windows-base",
       "architecture": {
         "value": "x64",
         "strategy": "external"
@@ -36,7 +36,7 @@
     {
       "name": "x64-release",
       "displayName": "x64 Release",
-      "inherits": "windows-msvc-base",
+      "inherits": "windows-base",
       "architecture": {
         "value": "x64",
         "strategy": "external"
