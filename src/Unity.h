@@ -1,9 +1,7 @@
 #pragma once
 
 #include <d3d11.h>
-
 #include <IUnityInterface.h>
-
 #include <libavutil/buffer.h>
 
 #ifdef __cplusplus
@@ -13,6 +11,9 @@ extern "C" {
 ID3D11Device* renderingout_get_d3d11_device(void);
 ID3D11DeviceContext* renderingout_get_d3d11_context(void);
 AVBufferRef* renderingout_get_hw_device(void);
+
+void renderingout_logf(const char* fmt, ...);
+void renderingout_log_errorf(const char* fmt, ...);
 
 #ifdef __cplusplus
 }

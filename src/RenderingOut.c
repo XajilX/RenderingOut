@@ -160,7 +160,8 @@ static void set_codec_options(
 	}
 	else if (strcmp(candidate->name, "h264_mf") == 0)
 	{
-		av_dict_set(options, "hw_encoding", "1", 0);
+		if (candidate->direct_d3d11)
+			av_dict_set(options, "hw_encoding", "1", 0);
 	}
 	else if (strcmp(candidate->name, "h264_nvenc") == 0)
 	{
@@ -181,7 +182,13 @@ static int try_open_encoder(
 
 	codec = avcodec_find_encoder_by_name(candidate->name);
 	if (!codec)
+	{
+		renderingout_logf(
+			"RenderingOut: encoder '%s' (%s) is not compiled/available in FFmpeg build",
+			candidate->name,
+			candidate->direct_d3d11 ? "D3D11 Direct" : "Readback");
 		return AVERROR_ENCODER_NOT_FOUND;
+	}
 
 	context = avcodec_alloc_context3(codec);
 	if (!context)
@@ -194,7 +201,10 @@ static int try_open_encoder(
 	context->time_base = (AVRational){ 1, ve->fps };
 	context->gop_size = ve->fps;
 	context->max_b_frames = 0;
-	context->flags |= AV_CODEC_FLAG_LOW_DELAY;
+
+	if (strcmp(candidate->name, "h264_mf") != 0)
+		context->flags |= AV_CODEC_FLAG_LOW_DELAY;
+
 	context->pix_fmt = candidate->direct_d3d11
 		? AV_PIX_FMT_D3D11
 		: candidate->input_format;
@@ -220,7 +230,12 @@ static int try_open_encoder(
 	{
 		ret = create_hw_frames(ve, candidate->input_format, &frames);
 		if (ret < 0)
+		{
+			renderingout_logf(
+				"RenderingOut: tried encoder '%s' (D3D11 direct), hw frames alloc failed: %s",
+				candidate->name, av_err2str(ret));
 			goto fail;
+		}
 
 		context->hw_frames_ctx = av_buffer_ref(frames);
 		if (!context->hw_frames_ctx)
@@ -234,19 +249,26 @@ static int try_open_encoder(
 	ret = avcodec_open2(context, codec, &options);
 	av_dict_free(&options);
 	if (ret < 0)
+	{
+		renderingout_logf(
+			"RenderingOut: tried encoder '%s' (%s), open failed: %s",
+			candidate->name,
+			candidate->direct_d3d11 ? "D3D11 Direct" : "Readback",
+			av_err2str(ret));
 		goto fail;
+	}
 
 	ve->ctx = context;
 	ve->hw_frames = frames;
 	ve->input_format = candidate->input_format;
 	ve->direct_d3d11 = candidate->direct_d3d11;
-	av_log(
-		NULL,
-		AV_LOG_INFO,
-		"RenderingOut: selected %s (%s, input=%s)\n",
+
+	renderingout_logf(
+		"RenderingOut: selected video encoder '%s' (%s, input format: %s, %dx%d @ %d fps)",
 		candidate->name,
-		candidate->direct_d3d11 ? "D3D11" : "readback",
-		av_get_pix_fmt_name(candidate->input_format));
+		candidate->direct_d3d11 ? "D3D11 Hardware Direct" : "Readback",
+		av_get_pix_fmt_name(candidate->input_format),
+		ve->width, ve->height, ve->fps);
 	return 0;
 
 fail:
@@ -270,8 +292,7 @@ static int initialize_encoder(
 	{
 		candidates[candidate_count++] =
 			(EncoderCandidate){ "h264_nvenc", texture_format, 1 };
-		if (texture_format == AV_PIX_FMT_NV12)
-			candidates[candidate_count++] =
+		candidates[candidate_count++] =
 			(EncoderCandidate){ "h264_mf", AV_PIX_FMT_NV12, 1 };
 	}
 
@@ -297,6 +318,9 @@ static int initialize_encoder(
 		}
 	}
 
+	renderingout_log_errorf(
+		"RenderingOut: failed to initialize any video encoder (%s)",
+		av_err2str(last_error));
 	return last_error;
 }
 
@@ -315,7 +339,10 @@ static int initialize_audio_stream(VideoEncoder* ve)
 	 */
 	codec = avcodec_find_encoder_by_name("aac");
 	if (!codec)
+	{
+		renderingout_log_errorf("RenderingOut: AAC codec not found");
 		return AVERROR_ENCODER_NOT_FOUND;
+	}
 
 	stream = avformat_new_stream(ve->format, codec);
 	if (!stream)
@@ -366,16 +393,19 @@ static int initialize_audio_stream(VideoEncoder* ve)
 	ve->audio_stream = stream;
 	ve->audio_frame = frame;
 	ve->audio_enabled = 1;
-	av_log(
-		NULL,
-		AV_LOG_INFO,
-		"RenderingOut: audio stream initialized (aac, %d Hz, %d ch, %d samples/frame)\n",
+
+	renderingout_logf(
+		"RenderingOut: audio stream initialized (codec: aac, %d Hz, %d channels, bitrate: %d bps, %d samples/frame)",
 		ctx->sample_rate,
 		ctx->ch_layout.nb_channels,
+		ctx->bit_rate,
 		frame->nb_samples);
 	return 0;
 
 fail:
+	renderingout_log_errorf(
+		"RenderingOut: audio stream initialization failed (%s)",
+		av_err2str(ret));
 	av_frame_free(&frame);
 	avcodec_free_context(&ctx);
 	return ret;
@@ -404,10 +434,8 @@ static int initialize_output(VideoEncoder* ve)
 	ret = initialize_audio_stream(ve);
 	if (ret < 0)
 	{
-		av_log(
-			NULL,
-			AV_LOG_WARNING,
-			"RenderingOut: audio stream init failed (%s), video-only\n",
+		renderingout_log_errorf(
+			"RenderingOut: audio stream init failed (%s), fallback to video-only",
 			av_err2str(ret));
 		ve->audio_enabled = 0;
 	}
@@ -416,7 +444,12 @@ static int initialize_output(VideoEncoder* ve)
 	{
 		ret = avio_open(&ve->format->pb, ve->filename, AVIO_FLAG_WRITE);
 		if (ret < 0)
+		{
+			renderingout_log_errorf(
+				"RenderingOut: avio_open failed for '%s' (%s)",
+				ve->filename, av_err2str(ret));
 			return ret;
+		}
 	}
 
 	if (strcmp(ve->format->oformat->name, "mp4") == 0 ||
@@ -426,9 +459,20 @@ static int initialize_output(VideoEncoder* ve)
 	ret = avformat_write_header(ve->format, &options);
 	av_dict_free(&options);
 	if (ret < 0)
+	{
+		renderingout_log_errorf(
+			"RenderingOut: avformat_write_header failed (%s)",
+			av_err2str(ret));
 		return ret;
+	}
 
 	ve->header_written = 1;
+	renderingout_logf(
+		"RenderingOut: header written for '%s' (Format: %s, Video Stream: #%d, Audio Stream: %s)",
+		ve->filename,
+		ve->format->oformat->name,
+		ve->stream ? ve->stream->index : -1,
+		ve->audio_enabled ? "Enabled (#1)" : "Disabled");
 	return 0;
 }
 
@@ -514,7 +558,7 @@ static int flush_audio_encoder(VideoEncoder* ve)
 }
 
 /*
- * Resamples interleaved S16 PCM samples from the Unity caller into the
+ * Resamples interleaved float PCM samples from the Unity caller into the
  * encoder's frame format (FLTP, stereo, 44100 Hz) and writes them to the
  * audio encoder. Uses an internal converter frame of encoder's frame_size;
  * swr_convert handles any leftover samples through its internal buffering.
@@ -541,7 +585,7 @@ static int write_audio_from_pcm(
 		channels <= 0 || channels > AV_NUM_DATA_POINTERS)
 		return AVERROR(EINVAL);
 
-	src_bytes_per_sample = channels * sizeof(int16_t);
+	src_bytes_per_sample = channels * sizeof(float);
 	src_total_samples = pcm_size / src_bytes_per_sample;
 	if (src_total_samples <= 0)
 		return AVERROR(EINVAL);
@@ -554,7 +598,7 @@ static int write_audio_from_pcm(
 		ve->audio_ctx->sample_fmt,
 		ve->audio_ctx->sample_rate,
 		&src_layout,
-		AV_SAMPLE_FMT_S16,
+		AV_SAMPLE_FMT_FLT,
 		sample_rate,
 		0, NULL);
 	if (ret < 0)
@@ -688,6 +732,12 @@ static int write_audio_from_pcm(
 	ret = 0;
 
 fail:
+	if (ret < 0)
+	{
+		renderingout_log_errorf(
+			"RenderingOut: write_audio_from_pcm failed with error (%s)",
+			av_err2str(ret));
+	}
 	av_frame_free(&converted);
 	swr_free(&resampler);
 	av_channel_layout_uninit(&src_layout);
@@ -749,10 +799,8 @@ static int finish_encoding(VideoEncoder* ve)
 				ve->pending_pcm_channels);
 			if (ret < 0)
 			{
-				av_log(
-					NULL,
-					AV_LOG_WARNING,
-					"RenderingOut: audio mux failed (%s), padding silence\n",
+				renderingout_log_errorf(
+					"RenderingOut: audio mux failed (%s), padding silence",
 					av_err2str(ret));
 				ve->audio_next_pts = 0;
 			}
@@ -782,6 +830,11 @@ static int finish_encoding(VideoEncoder* ve)
 		if (ret < 0 && result >= 0)
 			result = ret;
 	}
+
+	renderingout_logf(
+		"RenderingOut: finish_encoding completed for '%s'. Total video frames: %lld",
+		ve->filename,
+		(long long)ve->next_pts);
 
 	avcodec_free_context(&ve->ctx);
 	avcodec_free_context(&ve->audio_ctx);
@@ -938,6 +991,10 @@ video_encoder_create(
 	if (!ve->filename)
 		goto fail;
 
+	renderingout_logf(
+		"RenderingOut: video_encoder_create('%s', %dx%d @ %d fps, bitrate: %d bps)",
+		filename, width, height, fps, bit_rate);
+
 	ret = avformat_alloc_output_context2(
 		&ve->format, NULL, NULL, filename);
 	if (ret < 0 || !ve->format)
@@ -1009,7 +1066,12 @@ video_encoder_submit_frame(VideoEncoder* ve, void* native_texture)
 			texture_format,
 			desc.SampleDesc.Count > 1);
 		if (ret < 0)
+		{
+			renderingout_log_errorf(
+				"RenderingOut: initialize encoder command failed (%s)",
+				av_err2str(ret));
 			return ret;
+		}
 	}
 	else if (texture_format != ve->texture_format)
 	{
@@ -1037,7 +1099,12 @@ video_encoder_submit_frame(VideoEncoder* ve, void* native_texture)
 			&frame);
 	}
 	if (ret < 0)
+	{
+		renderingout_log_errorf(
+			"RenderingOut: frame copy/readback failed (%s)",
+			av_err2str(ret));
 		return ret;
+	}
 
 	ret = dispatch_worker_command(
 		ve,
@@ -1047,6 +1114,10 @@ video_encoder_submit_frame(VideoEncoder* ve, void* native_texture)
 		0);
 	if (ret >= 0)
 		++ve->next_pts;
+	else
+		renderingout_log_errorf(
+			"RenderingOut: encode frame command failed (%s)",
+			av_err2str(ret));
 	return ret;
 }
 
@@ -1061,7 +1132,9 @@ video_encoder_mux_audio(
 	uint8_t* copy = NULL;
 
 	if (!ve || !pcm_data || pcm_length_bytes <= 0 ||
-		sample_rate <= 0 || channels <= 0)
+		sample_rate <= 0 || channels <= 0 ||
+		channels > AV_NUM_DATA_POINTERS ||
+		pcm_length_bytes % (channels * (int)sizeof(float)) != 0)
 		return AVERROR(EINVAL);
 	if (ve->fatal_error < 0)
 		return ve->fatal_error;
@@ -1072,6 +1145,13 @@ video_encoder_mux_audio(
 	if (!copy)
 		return AVERROR(ENOMEM);
 	memcpy(copy, pcm_data, pcm_length_bytes);
+
+	renderingout_logf(
+		"RenderingOut: registered PCM audio data (%d bytes, %d Hz, %d channels, duration: %.2f sec)",
+		pcm_length_bytes,
+		sample_rate,
+		channels,
+		(double)pcm_length_bytes / (channels * sizeof(float) * sample_rate));
 
 	/*
 	 * Overwrites any previously registered buffer; the actual encode happens
