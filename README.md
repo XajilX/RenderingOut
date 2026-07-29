@@ -8,7 +8,8 @@ D3D11 textures to video files through FFmpeg.
 - Encodes Unity `Texture` objects from their native D3D11 texture pointers.
 - Tries H.264 encoders in order of availability, including NVENC, Media
   Foundation, AMF, QSV, and libx264.
-- Uses direct D3D11 hardware frames where supported, with a readback fallback.
+- Uses direct D3D11 hardware frames where supported, including GPU-side
+  RGBA/BGRA-to-NV12 conversion for Media Foundation, with a readback fallback.
 - Accepts interleaved 32-bit float PCM audio and muxes it as AAC.
 - Reports initialization and encoding errors through the Unity log.
 
@@ -68,6 +69,8 @@ Important API constraints:
 
 - Output width and height must be positive, even numbers.
 - Submitted textures must match the configured dimensions and pixel format.
+- Direct Media Foundation input requires a non-multisampled texture and a
+  driver that supports D3D11 video processing plus encoder-bound NV12 surfaces.
 - `video_encoder_submit_frame` must be called serially from the render thread.
 - Register audio after the first video frame and before
   `video_encoder_free`. PCM samples must be normalized, interleaved 32-bit

@@ -1,4 +1,5 @@
 #include "D3D11FrameConverter.h"
+#include "Unity.h"
 
 #include <errno.h>
 #include <stdint.h>
@@ -17,13 +18,19 @@ struct D3D11FrameConverter
     AVD3D11VADeviceContext* hw_context;
     ID3D11Device* device;
     ID3D11DeviceContext* context;
+    ID3D11VideoDevice* video_device;
+    ID3D11VideoContext* video_context;
+    ID3D11VideoProcessorEnumerator* video_enumerator;
+    ID3D11VideoProcessor* video_processor;
     ID3D11Texture2D* staging;
     ID3D11Texture2D* resolve;
     D3D11_TEXTURE2D_DESC staging_desc;
     D3D11_TEXTURE2D_DESC resolve_desc;
+    DXGI_FORMAT video_source_format;
     struct SwsContext* sws;
     int width;
     int height;
+    int fps;
 };
 
 static void lock_context(D3D11FrameConverter* converter)
@@ -51,6 +58,139 @@ static DXGI_FORMAT normalized_dxgi_format(DXGI_FORMAT format)
     default:
         return format;
     }
+}
+
+static void release_video_processor(D3D11FrameConverter* converter)
+{
+    if (converter->video_processor)
+    {
+        converter->video_processor->lpVtbl->Release(converter->video_processor);
+        converter->video_processor = NULL;
+    }
+    if (converter->video_enumerator)
+    {
+        converter->video_enumerator->lpVtbl->Release(
+            converter->video_enumerator);
+        converter->video_enumerator = NULL;
+    }
+    converter->video_source_format = DXGI_FORMAT_UNKNOWN;
+}
+
+static int ensure_video_processor(
+    D3D11FrameConverter* converter,
+    DXGI_FORMAT source_format)
+{
+    D3D11_VIDEO_PROCESSOR_CONTENT_DESC content_desc = { 0 };
+    D3D11_VIDEO_PROCESSOR_CAPS caps = { 0 };
+    UINT source_support = 0;
+    UINT destination_support = 0;
+    HRESULT hr;
+
+    source_format = normalized_dxgi_format(source_format);
+    if (source_format != DXGI_FORMAT_B8G8R8A8_UNORM &&
+        source_format != DXGI_FORMAT_R8G8B8A8_UNORM)
+        return AVERROR(ENOSYS);
+    if (!converter->video_device || !converter->video_context)
+        return AVERROR(ENOSYS);
+
+    if (converter->video_processor &&
+        converter->video_source_format == source_format)
+        return 0;
+
+    release_video_processor(converter);
+
+    content_desc.InputFrameFormat =
+        D3D11_VIDEO_FRAME_FORMAT_PROGRESSIVE;
+    content_desc.InputFrameRate.Numerator = converter->fps;
+    content_desc.InputFrameRate.Denominator = 1;
+    content_desc.InputWidth = converter->width;
+    content_desc.InputHeight = converter->height;
+    content_desc.OutputFrameRate.Numerator = converter->fps;
+    content_desc.OutputFrameRate.Denominator = 1;
+    content_desc.OutputWidth = converter->width;
+    content_desc.OutputHeight = converter->height;
+    content_desc.Usage = D3D11_VIDEO_USAGE_PLAYBACK_NORMAL;
+
+    hr = converter->video_device->lpVtbl->CreateVideoProcessorEnumerator(
+        converter->video_device,
+        &content_desc,
+        &converter->video_enumerator);
+    if (FAILED(hr))
+    {
+        renderingout_log_errorf(
+            "RenderingOut: D3D11 video processor enumerator creation failed "
+            "(HRESULT 0x%08lx)",
+            (unsigned long)hr);
+        return AVERROR_EXTERNAL;
+    }
+
+    hr = converter->video_enumerator->lpVtbl->CheckVideoProcessorFormat(
+        converter->video_enumerator,
+        source_format,
+        &source_support);
+    if (FAILED(hr) ||
+        !(source_support & D3D11_VIDEO_PROCESSOR_FORMAT_SUPPORT_INPUT))
+    {
+        renderingout_log_errorf(
+            "RenderingOut: D3D11 video processor does not support input "
+            "DXGI format %d (HRESULT 0x%08lx, support 0x%x)",
+            (int)source_format,
+            (unsigned long)hr,
+            source_support);
+        release_video_processor(converter);
+        return AVERROR(ENOSYS);
+    }
+
+    hr = converter->video_enumerator->lpVtbl->CheckVideoProcessorFormat(
+        converter->video_enumerator,
+        DXGI_FORMAT_NV12,
+        &destination_support);
+    if (FAILED(hr) ||
+        !(destination_support & D3D11_VIDEO_PROCESSOR_FORMAT_SUPPORT_OUTPUT))
+    {
+        renderingout_log_errorf(
+            "RenderingOut: D3D11 video processor does not support NV12 output "
+            "(HRESULT 0x%08lx, support 0x%x)",
+            (unsigned long)hr,
+            destination_support);
+        release_video_processor(converter);
+        return AVERROR(ENOSYS);
+    }
+
+    hr = converter->video_enumerator->lpVtbl->GetVideoProcessorCaps(
+        converter->video_enumerator,
+        &caps);
+    if (FAILED(hr) || caps.RateConversionCapsCount == 0)
+    {
+        renderingout_log_errorf(
+            "RenderingOut: D3D11 video processor exposes no usable rate "
+            "conversion capability (HRESULT 0x%08lx)",
+            (unsigned long)hr);
+        release_video_processor(converter);
+        return AVERROR(ENOSYS);
+    }
+
+    hr = converter->video_device->lpVtbl->CreateVideoProcessor(
+        converter->video_device,
+        converter->video_enumerator,
+        0,
+        &converter->video_processor);
+    if (FAILED(hr))
+    {
+        renderingout_log_errorf(
+            "RenderingOut: D3D11 video processor creation failed "
+            "(HRESULT 0x%08lx)",
+            (unsigned long)hr);
+        release_video_processor(converter);
+        return AVERROR_EXTERNAL;
+    }
+
+    converter->video_source_format = source_format;
+    renderingout_logf(
+        "RenderingOut: D3D11 GPU color conversion ready "
+        "(DXGI format %d -> NV12)",
+        (int)source_format);
+    return 0;
 }
 
 enum AVPixelFormat d3d11_texture_pixel_format(DXGI_FORMAT format)
@@ -334,17 +474,169 @@ static int convert_mapped_frame(
     return scaled == converter->height ? 0 : AVERROR_EXTERNAL;
 }
 
+static int convert_texture_to_nv12(
+    D3D11FrameConverter* converter,
+    ID3D11Resource* source,
+    const D3D11_TEXTURE2D_DESC* source_desc,
+    ID3D11Resource* destination,
+    const D3D11_TEXTURE2D_DESC* destination_desc,
+    UINT destination_subresource)
+{
+    D3D11_VIDEO_PROCESSOR_INPUT_VIEW_DESC input_desc = { 0 };
+    D3D11_VIDEO_PROCESSOR_OUTPUT_VIEW_DESC output_desc = { 0 };
+    D3D11_VIDEO_PROCESSOR_COLOR_SPACE source_color = { 0 };
+    D3D11_VIDEO_PROCESSOR_COLOR_SPACE destination_color = { 0 };
+    D3D11_VIDEO_PROCESSOR_STREAM stream = { 0 };
+    ID3D11VideoProcessorInputView* input_view = NULL;
+    ID3D11VideoProcessorOutputView* output_view = NULL;
+    RECT rect;
+    HRESULT hr;
+    int ret;
+
+    ret = ensure_video_processor(converter, source_desc->Format);
+    if (ret < 0)
+        return ret;
+    if (normalized_dxgi_format(destination_desc->Format) != DXGI_FORMAT_NV12)
+        return AVERROR(EINVAL);
+
+    input_desc.ViewDimension = D3D11_VPIV_DIMENSION_TEXTURE2D;
+    input_desc.Texture2D.MipSlice = 0;
+    input_desc.Texture2D.ArraySlice = 0;
+    hr = converter->video_device->lpVtbl->CreateVideoProcessorInputView(
+        converter->video_device,
+        source,
+        converter->video_enumerator,
+        &input_desc,
+        &input_view);
+    if (FAILED(hr))
+    {
+        renderingout_log_errorf(
+            "RenderingOut: D3D11 video processor input view creation failed "
+            "(source DXGI format %d, bind flags 0x%x, HRESULT 0x%08lx)",
+            (int)source_desc->Format,
+            source_desc->BindFlags,
+            (unsigned long)hr);
+        return AVERROR_EXTERNAL;
+    }
+
+    if (destination_desc->ArraySize > 1)
+    {
+        output_desc.ViewDimension =
+            D3D11_VPOV_DIMENSION_TEXTURE2DARRAY;
+        output_desc.Texture2DArray.MipSlice = 0;
+        output_desc.Texture2DArray.FirstArraySlice =
+            destination_subresource;
+        output_desc.Texture2DArray.ArraySize = 1;
+    }
+    else
+    {
+        output_desc.ViewDimension = D3D11_VPOV_DIMENSION_TEXTURE2D;
+        output_desc.Texture2D.MipSlice = 0;
+    }
+
+    hr = converter->video_device->lpVtbl->CreateVideoProcessorOutputView(
+        converter->video_device,
+        destination,
+        converter->video_enumerator,
+        &output_desc,
+        &output_view);
+    if (FAILED(hr))
+    {
+        renderingout_log_errorf(
+            "RenderingOut: D3D11 video processor output view creation failed "
+            "(destination DXGI format %d, bind flags 0x%x, HRESULT 0x%08lx)",
+            (int)destination_desc->Format,
+            destination_desc->BindFlags,
+            (unsigned long)hr);
+        input_view->lpVtbl->Release(input_view);
+        return AVERROR_EXTERNAL;
+    }
+
+    rect.left = 0;
+    rect.top = 0;
+    rect.right = converter->width;
+    rect.bottom = converter->height;
+
+    source_color.RGB_Range = 0;
+    source_color.YCbCr_Matrix = converter->height >= 720;
+    source_color.Nominal_Range =
+        D3D11_VIDEO_PROCESSOR_NOMINAL_RANGE_0_255;
+    destination_color.YCbCr_Matrix = converter->height >= 720;
+    destination_color.Nominal_Range =
+        D3D11_VIDEO_PROCESSOR_NOMINAL_RANGE_16_235;
+
+    stream.Enable = TRUE;
+    stream.OutputIndex = 0;
+    stream.InputFrameOrField = 0;
+    stream.pInputSurface = input_view;
+
+    lock_context(converter);
+    converter->video_context->lpVtbl->VideoProcessorSetStreamFrameFormat(
+        converter->video_context,
+        converter->video_processor,
+        0,
+        D3D11_VIDEO_FRAME_FORMAT_PROGRESSIVE);
+    converter->video_context->lpVtbl->VideoProcessorSetStreamSourceRect(
+        converter->video_context,
+        converter->video_processor,
+        0,
+        TRUE,
+        &rect);
+    converter->video_context->lpVtbl->VideoProcessorSetStreamDestRect(
+        converter->video_context,
+        converter->video_processor,
+        0,
+        TRUE,
+        &rect);
+    converter->video_context->lpVtbl->VideoProcessorSetOutputTargetRect(
+        converter->video_context,
+        converter->video_processor,
+        TRUE,
+        &rect);
+    converter->video_context->lpVtbl->VideoProcessorSetStreamColorSpace(
+        converter->video_context,
+        converter->video_processor,
+        0,
+        &source_color);
+    converter->video_context->lpVtbl->VideoProcessorSetOutputColorSpace(
+        converter->video_context,
+        converter->video_processor,
+        &destination_color);
+
+    hr = converter->video_context->lpVtbl->VideoProcessorBlt(
+        converter->video_context,
+        converter->video_processor,
+        output_view,
+        0,
+        1,
+        &stream);
+    unlock_context(converter);
+
+    output_view->lpVtbl->Release(output_view);
+    input_view->lpVtbl->Release(input_view);
+    if (FAILED(hr))
+    {
+        renderingout_log_errorf(
+            "RenderingOut: D3D11 RGB-to-NV12 conversion failed "
+            "(HRESULT 0x%08lx)",
+            (unsigned long)hr);
+        return AVERROR_EXTERNAL;
+    }
+    return 0;
+}
+
 int d3d11_frame_converter_create(
     D3D11FrameConverter** converter,
     AVBufferRef* hw_device,
     int width,
-    int height)
+    int height,
+    int fps)
 {
     D3D11FrameConverter* result;
     AVHWDeviceContext* device_context;
     AVD3D11VADeviceContext* d3d11_context;
 
-    if (!converter || !hw_device || width <= 0 || height <= 0)
+    if (!converter || !hw_device || width <= 0 || height <= 0 || fps <= 0)
         return AVERROR(EINVAL);
 
     device_context = (AVHWDeviceContext*)hw_device->data;
@@ -370,8 +662,12 @@ int d3d11_frame_converter_create(
     result->hw_context = d3d11_context;
     result->device = d3d11_context->device;
     result->context = d3d11_context->device_context;
+    result->video_device = d3d11_context->video_device;
+    result->video_context = d3d11_context->video_context;
+    result->video_source_format = DXGI_FORMAT_UNKNOWN;
     result->width = width;
     result->height = height;
+    result->fps = fps;
     *converter = result;
     return 0;
 }
@@ -385,6 +681,7 @@ void d3d11_frame_converter_free(D3D11FrameConverter** converter)
 
     value = *converter;
     sws_freeContext(value->sws);
+    release_video_processor(value);
     if (value->staging)
         value->staging->lpVtbl->Release(value->staging);
     if (value->resolve)
@@ -392,6 +689,24 @@ void d3d11_frame_converter_free(D3D11FrameConverter** converter)
     av_buffer_unref(&value->hw_device);
     free(value);
     *converter = NULL;
+}
+
+int d3d11_frame_prepare_nv12_conversion(
+    D3D11FrameConverter* converter,
+    DXGI_FORMAT source_format)
+{
+    enum AVPixelFormat format;
+
+    if (!converter)
+        return AVERROR(EINVAL);
+
+    format = d3d11_texture_pixel_format(source_format);
+    if (format == AV_PIX_FMT_NV12)
+        return 0;
+    if (format != AV_PIX_FMT_BGRA && format != AV_PIX_FMT_RGBA)
+        return AVERROR(ENOSYS);
+
+    return ensure_video_processor(converter, source_format);
 }
 
 int d3d11_frame_copy_to_hw(
@@ -402,6 +717,7 @@ int d3d11_frame_copy_to_hw(
     AVFrame** frame)
 {
     D3D11_TEXTURE2D_DESC source_desc;
+    D3D11_TEXTURE2D_DESC destination_desc;
     AVFrame* result;
     UINT destination_subresource;
     int ret;
@@ -428,18 +744,41 @@ int d3d11_frame_copy_to_hw(
     }
 
     destination_subresource = (UINT)(uintptr_t)result->data[1];
-    lock_context(converter);
-    converter->context->lpVtbl->CopySubresourceRegion(
-        converter->context,
-        (ID3D11Resource*)result->data[0],
-        destination_subresource,
-        0,
-        0,
-        0,
-        resource,
-        0,
-        NULL);
-    unlock_context(converter);
+    ((ID3D11Texture2D*)result->data[0])->lpVtbl->GetDesc(
+        (ID3D11Texture2D*)result->data[0],
+        &destination_desc);
+
+    if (normalized_dxgi_format(source_desc.Format) ==
+        normalized_dxgi_format(destination_desc.Format))
+    {
+        lock_context(converter);
+        converter->context->lpVtbl->CopySubresourceRegion(
+            converter->context,
+            (ID3D11Resource*)result->data[0],
+            destination_subresource,
+            0,
+            0,
+            0,
+            resource,
+            0,
+            NULL);
+        unlock_context(converter);
+    }
+    else
+    {
+        ret = convert_texture_to_nv12(
+            converter,
+            resource,
+            &source_desc,
+            (ID3D11Resource*)result->data[0],
+            &destination_desc,
+            destination_subresource);
+        if (ret < 0)
+        {
+            av_frame_free(&result);
+            return ret;
+        }
+    }
 
     set_frame_metadata(result, converter->width, converter->height, pts);
     *frame = result;

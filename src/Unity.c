@@ -2,9 +2,11 @@
 
 #include <stdarg.h>
 #include <stdio.h>
+#include <string.h>
 
 #include <libavutil/hwcontext.h>
 #include <libavutil/hwcontext_d3d11va.h>
+#include <libavutil/log.h>
 
 #include <IUnityGraphicsD3D11.h>
 #include <IUnityLog.h>
@@ -13,12 +15,49 @@ static ID3D11Device* s_device = NULL;
 static ID3D11DeviceContext* s_device_context = NULL;
 static AVBufferRef* s_hw_device = NULL;
 static IUnityLog* s_unity_log = NULL;
+static __declspec(thread) int s_probe_logging_suppressed = 0;
+
+static void renderingout_ffmpeg_log_callback(
+	void* context,
+	int level,
+	const char* format,
+	va_list args)
+{
+	char buffer[2048];
+	size_t length;
+	int print_prefix = 1;
+
+        if (!s_unity_log || s_probe_logging_suppressed ||
+                level > av_log_get_level())
+                return;
+
+	av_log_format_line2(
+		context,
+		level,
+		format,
+		args,
+		buffer,
+		sizeof(buffer),
+		&print_prefix);
+
+	length = strlen(buffer);
+	while (length > 0 &&
+		(buffer[length - 1] == '\n' || buffer[length - 1] == '\r'))
+		buffer[--length] = '\0';
+	if (length == 0)
+		return;
+
+	if (level <= AV_LOG_ERROR)
+		UNITY_LOG_ERROR(s_unity_log, buffer);
+	else
+		UNITY_LOG(s_unity_log, buffer);
+}
 
 void renderingout_logf(const char* fmt, ...)
 {
-	if (!s_unity_log)
-		return;
-	char buffer[1024];
+        if (!s_unity_log || s_probe_logging_suppressed)
+                return;
+	char buffer[2048];
 	va_list args;
 	va_start(args, fmt);
 	vsnprintf(buffer, sizeof(buffer), fmt, args);
@@ -28,14 +67,19 @@ void renderingout_logf(const char* fmt, ...)
 
 void renderingout_log_errorf(const char* fmt, ...)
 {
-	if (!s_unity_log)
-		return;
-	char buffer[1024];
+        if (!s_unity_log || s_probe_logging_suppressed)
+                return;
+	char buffer[2048];
 	va_list args;
 	va_start(args, fmt);
 	vsnprintf(buffer, sizeof(buffer), fmt, args);
 	va_end(args);
-	UNITY_LOG_ERROR(s_unity_log, buffer);
+        UNITY_LOG_ERROR(s_unity_log, buffer);
+}
+
+void renderingout_set_probe_logging_suppressed(int suppressed)
+{
+        s_probe_logging_suppressed = suppressed != 0;
 }
 
 ID3D11Device* renderingout_get_d3d11_device(void)
@@ -62,6 +106,8 @@ UnityPluginLoad(IUnityInterfaces* unity_interfaces)
 	int ret;
 
 	s_unity_log = unity_interfaces->GetInterface(IUnityLog_GUID);
+	av_log_set_level(AV_LOG_VERBOSE);
+	av_log_set_callback(renderingout_ffmpeg_log_callback);
 	UNITY_LOG(s_unity_log, "RenderingOut: plugin loading.");
 
 	d3d11 = unity_interfaces->GetInterface(IUnityGraphicsD3D11_GUID);
@@ -136,5 +182,6 @@ UnityPluginUnload(void)
 	s_device_context = NULL;
 	s_device = NULL;
 	av_buffer_unref(&s_hw_device);
+	av_log_set_callback(av_log_default_callback);
 	s_unity_log = NULL;
 }

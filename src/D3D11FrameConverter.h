@@ -19,14 +19,26 @@ int d3d11_frame_converter_create(
     D3D11FrameConverter** converter,
     AVBufferRef* hw_device,
     int width,
-    int height
+    int height,
+    int fps
 );
 
 void d3d11_frame_converter_free(D3D11FrameConverter** converter);
 
 /*
- * Copies resource into a surface owned by FFmpeg's hardware frame pool. This
- * keeps Unity free to reuse it while the encoder still owns the AVFrame.
+ * Verifies that a non-NV12 source can be converted to an encoder-ready NV12
+ * surface entirely on the GPU. Call this before selecting h264_mf direct mode.
+ */
+int d3d11_frame_prepare_nv12_conversion(
+    D3D11FrameConverter* converter,
+    DXGI_FORMAT source_format
+);
+
+/*
+ * Copies resource into a surface owned by FFmpeg's hardware frame pool. When
+ * the destination is NV12 and the source is RGB, D3D11 video processing is
+ * used for GPU-side color conversion. This keeps Unity free to reuse its
+ * render target while the encoder owns the resulting AVFrame.
  */
 int d3d11_frame_copy_to_hw(
     D3D11FrameConverter* converter,

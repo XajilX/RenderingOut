@@ -14,6 +14,7 @@ AVBufferRef* renderingout_get_hw_device(void);
 
 void renderingout_logf(const char* fmt, ...);
 void renderingout_log_errorf(const char* fmt, ...);
+void renderingout_set_probe_logging_suppressed(int suppressed);
 
 #ifdef __cplusplus
 }

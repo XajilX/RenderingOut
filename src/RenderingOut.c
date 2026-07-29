@@ -7,6 +7,7 @@
 #include <objbase.h>
 #include <process.h>
 #include <stdint.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <windows.h>
@@ -16,6 +17,7 @@
 #include <libavutil/dict.h>
 #include <libavutil/error.h>
 #include <libavutil/hwcontext.h>
+#include <libavutil/hwcontext_d3d11va.h>
 #include <libavutil/log.h>
 #include <libavutil/mem.h>
 #include <libavutil/opt.h>
@@ -111,13 +113,15 @@ static int write_available_packets(
 }
 
 static int create_hw_frames(
-	VideoEncoder* ve,
-	enum AVPixelFormat software_format,
-	AVBufferRef** frames)
+        VideoEncoder* ve,
+        enum AVPixelFormat software_format,
+        UINT bind_flags,
+        AVBufferRef** frames)
 {
-	AVBufferRef* result;
-	AVHWFramesContext* context;
-	int ret;
+        AVBufferRef* result;
+        AVHWFramesContext* context;
+        AVD3D11VAFramesContext* d3d11_context;
+        int ret;
 
 	if (!renderingout_get_hw_device())
 		return AVERROR(ENODEV);
@@ -131,27 +135,29 @@ static int create_hw_frames(
 	context->sw_format = software_format;
 	context->width = ve->width;
 	context->height = ve->height;
+	d3d11_context = (AVD3D11VAFramesContext*)context->hwctx;
+	d3d11_context->BindFlags = bind_flags;
 
-	/*
-	 * D3D11 hardware frames are texture-array slices. The fixed pool lets the
-	 * encoder retain a frame without retaining Unity's render target.
-	 */
-	context->initial_pool_size = 16;
+        /*
+         * D3D11 hardware frames are texture-array slices. The fixed pool lets the
+         * encoder retain a frame without retaining Unity's render target.
+         */
+        context->initial_pool_size = 16;
 
-	ret = av_hwframe_ctx_init(result);
-	if (ret < 0)
+        ret = av_hwframe_ctx_init(result);
+        if (ret < 0)
 	{
 		av_buffer_unref(&result);
-		return ret;
-	}
+                return ret;
+        }
 
-	*frames = result;
-	return 0;
+        *frames = result;
+        return 0;
 }
 
 static void set_codec_options(
-	const EncoderCandidate* candidate,
-	AVDictionary** options)
+        const EncoderCandidate* candidate,
+        AVDictionary** options)
 {
 	if (strcmp(candidate->name, "libx264") == 0)
 	{
@@ -167,28 +173,66 @@ static void set_codec_options(
 	{
 		av_dict_set(options, "delay", "0", 0);
 		av_dict_set(options, "zerolatency", "1", 0);
-	}
+        }
+}
+
+static const char* encoder_candidate_mode(const EncoderCandidate* candidate)
+{
+        return candidate->direct_d3d11 ? "direct" : "readback";
+}
+
+static void append_encoder_attempt(
+        char* summary,
+        size_t summary_size,
+        const char* attempt)
+{
+        size_t length;
+
+        if (!summary || summary_size == 0 || !attempt)
+                return;
+
+        length = strlen(summary);
+        if (length >= summary_size - 1)
+                return;
+
+        snprintf(
+                summary + length,
+                summary_size - length,
+                "%s%s",
+                length > 0 ? "; " : "",
+                attempt);
 }
 
 static int try_open_encoder(
-	VideoEncoder* ve,
-	const EncoderCandidate* candidate)
+        VideoEncoder* ve,
+        const EncoderCandidate* candidate,
+        char* attempt,
+        size_t attempt_size)
 {
 	const AVCodec* codec;
 	AVCodecContext* context = NULL;
-	AVBufferRef* frames = NULL;
-	AVDictionary* options = NULL;
-	int ret;
+        AVBufferRef* frames = NULL;
+        AVDictionary* options = NULL;
+        int ret;
 
-	codec = avcodec_find_encoder_by_name(candidate->name);
-	if (!codec)
-	{
-		renderingout_logf(
-			"RenderingOut: encoder '%s' (%s) is not compiled/available in FFmpeg build",
-			candidate->name,
-			candidate->direct_d3d11 ? "D3D11 Direct" : "Readback");
-		return AVERROR_ENCODER_NOT_FOUND;
-	}
+        snprintf(
+                attempt,
+                attempt_size,
+                "%s/%s=failed",
+                candidate->name,
+                encoder_candidate_mode(candidate));
+
+        codec = avcodec_find_encoder_by_name(candidate->name);
+        if (!codec)
+        {
+                snprintf(
+                        attempt,
+                        attempt_size,
+                        "%s/%s=unavailable",
+                        candidate->name,
+                        encoder_candidate_mode(candidate));
+                return AVERROR_ENCODER_NOT_FOUND;
+        }
 
 	context = avcodec_alloc_context3(codec);
 	if (!context)
@@ -226,15 +270,33 @@ static int try_open_encoder(
 	if (ve->format->oformat->flags & AVFMT_GLOBALHEADER)
 		context->flags |= AV_CODEC_FLAG_GLOBAL_HEADER;
 
-	if (candidate->direct_d3d11)
-	{
-		ret = create_hw_frames(ve, candidate->input_format, &frames);
-		if (ret < 0)
-		{
-			renderingout_logf(
-				"RenderingOut: tried encoder '%s' (D3D11 direct), hw frames alloc failed: %s",
-				candidate->name, av_err2str(ret));
-			goto fail;
+        if (candidate->direct_d3d11)
+        {
+                UINT bind_flags = 0;
+
+                /*
+                 * Media Foundation consumes NV12 video-encoder surfaces. The render
+                 * target flag additionally lets the D3D11 video processor write the
+                 * RGB-to-NV12 result directly into the encoder-owned frame.
+                 */
+                if (strcmp(candidate->name, "h264_mf") == 0)
+                        bind_flags =
+                                D3D11_BIND_VIDEO_ENCODER |
+                                D3D11_BIND_RENDER_TARGET;
+
+                ret = create_hw_frames(
+                        ve,
+                        candidate->input_format,
+                        bind_flags,
+                        &frames);
+                if (ret < 0)
+                {
+                        snprintf(
+                                attempt,
+                                attempt_size,
+                                "%s/direct=hw-frames failed (%s)",
+                                candidate->name, av_err2str(ret));
+                        goto fail;
 		}
 
 		context->hw_frames_ctx = av_buffer_ref(frames);
@@ -248,28 +310,30 @@ static int try_open_encoder(
 	set_codec_options(candidate, &options);
 	ret = avcodec_open2(context, codec, &options);
 	av_dict_free(&options);
-	if (ret < 0)
-	{
-		renderingout_logf(
-			"RenderingOut: tried encoder '%s' (%s), open failed: %s",
-			candidate->name,
-			candidate->direct_d3d11 ? "D3D11 Direct" : "Readback",
-			av_err2str(ret));
-		goto fail;
+        if (ret < 0)
+        {
+                snprintf(
+                        attempt,
+                        attempt_size,
+                        "%s/%s=open failed (%s)",
+                        candidate->name,
+                        encoder_candidate_mode(candidate),
+                        av_err2str(ret));
+                goto fail;
 	}
 
 	ve->ctx = context;
 	ve->hw_frames = frames;
-	ve->input_format = candidate->input_format;
-	ve->direct_d3d11 = candidate->direct_d3d11;
+        ve->input_format = candidate->input_format;
+        ve->direct_d3d11 = candidate->direct_d3d11;
 
-	renderingout_logf(
-		"RenderingOut: selected video encoder '%s' (%s, input format: %s, %dx%d @ %d fps)",
-		candidate->name,
-		candidate->direct_d3d11 ? "D3D11 Hardware Direct" : "Readback",
-		av_get_pix_fmt_name(candidate->input_format),
-		ve->width, ve->height, ve->fps);
-	return 0;
+        snprintf(
+                attempt,
+                attempt_size,
+                "%s/%s=selected",
+                candidate->name,
+                encoder_candidate_mode(candidate));
+        return 0;
 
 fail:
 	av_dict_free(&options);
@@ -279,21 +343,65 @@ fail:
 }
 
 static int initialize_encoder(
-	VideoEncoder* ve,
-	enum AVPixelFormat texture_format,
-	int multisampled)
+        VideoEncoder* ve,
+        enum AVPixelFormat texture_format,
+        int multisampled)
 {
-	EncoderCandidate candidates[8];
-	int candidate_count = 0;
-	int i;
-	int last_error = AVERROR_ENCODER_NOT_FOUND;
+        EncoderCandidate candidates[8];
+        char selection_summary[1536] = { 0 };
+        char attempt[256];
+        int candidate_count = 0;
+        int mf_direct_ready = 0;
+        int i;
+        int last_error = AVERROR_ENCODER_NOT_FOUND;
 
-	if (!multisampled)
+        renderingout_set_probe_logging_suppressed(1);
+
+        if (!multisampled)
 	{
+		DXGI_FORMAT source_format = DXGI_FORMAT_UNKNOWN;
+		int ret;
+
 		candidates[candidate_count++] =
 			(EncoderCandidate){ "h264_nvenc", texture_format, 1 };
-		candidates[candidate_count++] =
-			(EncoderCandidate){ "h264_mf", AV_PIX_FMT_NV12, 1 };
+
+		switch (texture_format)
+		{
+		case AV_PIX_FMT_NV12:
+			source_format = DXGI_FORMAT_NV12;
+			break;
+		case AV_PIX_FMT_BGRA:
+			source_format = DXGI_FORMAT_B8G8R8A8_UNORM;
+			break;
+		case AV_PIX_FMT_RGBA:
+			source_format = DXGI_FORMAT_R8G8B8A8_UNORM;
+			break;
+		default:
+			break;
+		}
+
+		ret = d3d11_frame_prepare_nv12_conversion(
+			ve->converter,
+			source_format);
+                if (ret >= 0)
+                        mf_direct_ready = 1;
+                else
+                {
+                        snprintf(
+                                attempt,
+                                sizeof(attempt),
+                                "h264_mf/direct=preflight failed for %s (%s)",
+                                av_get_pix_fmt_name(texture_format),
+                                av_err2str(ret));
+                        append_encoder_attempt(
+                                selection_summary,
+                                sizeof(selection_summary),
+                                attempt);
+                }
+
+		if (mf_direct_ready)
+			candidates[candidate_count++] =
+				(EncoderCandidate){ "h264_mf", AV_PIX_FMT_NV12, 1 };
 	}
 
 	candidates[candidate_count++] =
@@ -307,20 +415,40 @@ static int initialize_encoder(
 	candidates[candidate_count++] =
 		(EncoderCandidate){ "libx264", AV_PIX_FMT_NV12, 0 };
 
-	for (i = 0; i < candidate_count; ++i)
-	{
-		last_error = try_open_encoder(ve, &candidates[i]);
-		if (last_error >= 0)
-		{
-			ve->initialized = 1;
-			ve->texture_format = texture_format;
-			return 0;
-		}
-	}
+        for (i = 0; i < candidate_count; ++i)
+        {
+                last_error = try_open_encoder(
+                        ve,
+                        &candidates[i],
+                        attempt,
+                        sizeof(attempt));
+                append_encoder_attempt(
+                        selection_summary,
+                        sizeof(selection_summary),
+                        attempt);
+                if (last_error >= 0)
+                {
+                        ve->initialized = 1;
+                        ve->texture_format = texture_format;
+                        renderingout_set_probe_logging_suppressed(0);
+                        renderingout_logf(
+                                "RenderingOut: encoder selection [%s]; "
+                                "input=%s, %dx%d @ %d fps",
+                                selection_summary,
+                                av_get_pix_fmt_name(
+                                        candidates[i].input_format),
+                                ve->width,
+                                ve->height,
+                                ve->fps);
+                        return 0;
+                }
+        }
 
-	renderingout_log_errorf(
-		"RenderingOut: failed to initialize any video encoder (%s)",
-		av_err2str(last_error));
+        renderingout_set_probe_logging_suppressed(0);
+        renderingout_log_errorf(
+                "RenderingOut: encoder selection failed [%s]; final error: %s",
+                selection_summary,
+                av_err2str(last_error));
 	return last_error;
 }
 
@@ -1008,7 +1136,8 @@ video_encoder_create(
 		&ve->converter,
 		renderingout_get_hw_device(),
 		width,
-		height);
+		height,
+		fps);
 	if (ret < 0)
 		goto fail;
 
