@@ -33,6 +33,25 @@ video_encoder_submit_frame(
     void* native_texture
 );
 
+#ifndef _WIN32
+/*
+ * Queues a frame for execution from Unity's render thread. Call
+ * GetRenderEventFunc() through GL.IssuePluginEvent after this function, then
+ * wait with video_encoder_wait_frame().
+ */
+UNITY_INTERFACE_EXPORT int UNITY_INTERFACE_API
+video_encoder_queue_frame(
+    VideoEncoder* ve,
+    void* native_texture
+);
+
+UNITY_INTERFACE_EXPORT int UNITY_INTERFACE_API
+video_encoder_wait_frame(
+    VideoEncoder* ve
+);
+
+#endif
+
 /*
  * Registers a PCM buffer to be muxed into the output when video_encoder_free
  * is called. The PCM data is resampled and re-encoded to AAC.

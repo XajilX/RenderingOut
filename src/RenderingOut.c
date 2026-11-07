@@ -18,6 +18,7 @@
 #include "OpenGLFrameConverter.h"
 
 #include <pthread.h>
+#include <stdatomic.h>
 #endif
 
 #include <libavcodec/avcodec.h>
@@ -33,6 +34,8 @@
 #include <libavutil/opt.h>
 #include <libavutil/pixdesc.h>
 #include <libswresample/swresample.h>
+
+typedef void (UNITY_INTERFACE_API * RenderingOutRenderingEvent)(int event_id);
 
 typedef struct EncoderCandidate
 {
@@ -71,6 +74,13 @@ struct VideoEncoder
 	pthread_t worker;
 	pthread_mutex_t worker_lock;
 	pthread_cond_t worker_changed;
+	pthread_mutex_t frame_lock;
+	pthread_cond_t frame_changed;
+	void* pending_frame_texture;
+	int frame_sync_started;
+	int frame_pending;
+	int frame_completed;
+	int frame_result;
 #endif
 	char* filename;
 	uint8_t* pending_pcm_data;
@@ -98,6 +108,12 @@ struct VideoEncoder
 	int64_t audio_next_pts;
 	int audio_enabled;
 };
+
+#define RENDERINGOUT_EVENT_ENCODE_FRAME 1
+
+#ifndef _WIN32
+static _Atomic(VideoEncoder*) s_pending_frame_encoder;
+#endif
 
 static int write_available_packets(
 	VideoEncoder* ve,
@@ -1218,6 +1234,36 @@ static int start_worker(VideoEncoder* ve)
 	return 0;
 }
 
+#ifndef _WIN32
+static int start_frame_sync(VideoEncoder* ve)
+{
+	int ret;
+
+	ret = pthread_mutex_init(&ve->frame_lock, NULL);
+	if (ret != 0)
+		return AVERROR(ret);
+	ret = pthread_cond_init(&ve->frame_changed, NULL);
+	if (ret != 0)
+	{
+		pthread_mutex_destroy(&ve->frame_lock);
+		return AVERROR(ret);
+	}
+
+	ve->frame_sync_started = 1;
+	return 0;
+}
+
+static void stop_frame_sync(VideoEncoder* ve)
+{
+	if (!ve->frame_sync_started)
+		return;
+
+	pthread_cond_destroy(&ve->frame_changed);
+	pthread_mutex_destroy(&ve->frame_lock);
+	ve->frame_sync_started = 0;
+}
+#endif
+
 static void stop_worker(VideoEncoder* ve)
 {
 	if (!ve->worker_started)
@@ -1321,6 +1367,10 @@ video_encoder_create(
 		width,
 		height,
 		fps);
+	if (ret < 0)
+		goto fail;
+
+	ret = start_frame_sync(ve);
 #endif
 	if (ret < 0)
 		goto fail;
@@ -1335,6 +1385,7 @@ fail:
 #ifdef _WIN32
 	d3d11_frame_converter_free(&ve->converter);
 #else
+	stop_frame_sync(ve);
 	opengl_frame_converter_free(&ve->converter);
 #endif
 	av_packet_free(&ve->packet);
@@ -1344,8 +1395,7 @@ fail:
 	return NULL;
 }
 
-UNITY_INTERFACE_EXPORT int UNITY_INTERFACE_API
-video_encoder_submit_frame(VideoEncoder* ve, void* native_texture)
+static int submit_frame_direct(VideoEncoder* ve, void* native_texture)
 {
 #ifdef _WIN32
 	ID3D11Resource* resource = (ID3D11Resource*)native_texture;
@@ -1375,10 +1425,23 @@ video_encoder_submit_frame(VideoEncoder* ve, void* native_texture)
 #else
 	ret = opengl_texture_info(native_texture, &texture_info);
 	if (ret < 0)
+	{
+		renderingout_log_errorf(
+			"RenderingOut: OpenGL texture query failed (%s)",
+			av_err2str(ret));
 		return ret;
+	}
 	if (texture_info.width != ve->width ||
 		texture_info.height != ve->height)
+	{
+		renderingout_log_errorf(
+			"RenderingOut: texture size mismatch: expected %dx%d, got %dx%d",
+			ve->width,
+			ve->height,
+			texture_info.width,
+			texture_info.height);
 		return AVERROR(EINVAL);
+	}
 	texture_format = texture_info.format;
 #endif
 
@@ -1460,6 +1523,90 @@ video_encoder_submit_frame(VideoEncoder* ve, void* native_texture)
 }
 
 UNITY_INTERFACE_EXPORT int UNITY_INTERFACE_API
+video_encoder_submit_frame(VideoEncoder* ve, void* native_texture)
+{
+	return submit_frame_direct(ve, native_texture);
+}
+
+#ifndef _WIN32
+UNITY_INTERFACE_EXPORT int UNITY_INTERFACE_API
+video_encoder_queue_frame(VideoEncoder* ve, void* native_texture)
+{
+	int result = 0;
+
+	if (!ve || !native_texture)
+		return AVERROR(EINVAL);
+	if (ve->fatal_error < 0)
+		return ve->fatal_error;
+
+	pthread_mutex_lock(&ve->frame_lock);
+	if (ve->frame_pending)
+		result = AVERROR(EBUSY);
+	else
+	{
+		ve->pending_frame_texture = native_texture;
+		ve->frame_pending = 1;
+		ve->frame_completed = 0;
+		ve->frame_result = 0;
+	}
+	pthread_mutex_unlock(&ve->frame_lock);
+
+	if (result >= 0)
+		atomic_store_explicit(
+			&s_pending_frame_encoder, ve, memory_order_release);
+	return result;
+}
+
+UNITY_INTERFACE_EXPORT int UNITY_INTERFACE_API
+video_encoder_wait_frame(VideoEncoder* ve)
+{
+	int result;
+
+	if (!ve)
+		return AVERROR(EINVAL);
+
+	pthread_mutex_lock(&ve->frame_lock);
+	while (!ve->frame_completed)
+		pthread_cond_wait(&ve->frame_changed, &ve->frame_lock);
+	result = ve->frame_result;
+	ve->frame_completed = 0;
+	ve->frame_pending = 0;
+	pthread_mutex_unlock(&ve->frame_lock);
+	return result;
+}
+
+static void UNITY_INTERFACE_API renderingout_render_event(int event_id)
+{
+	VideoEncoder* ve;
+	void* native_texture;
+	int result;
+
+	if (event_id != RENDERINGOUT_EVENT_ENCODE_FRAME)
+		return;
+
+	ve = atomic_exchange_explicit(
+		&s_pending_frame_encoder, NULL, memory_order_acquire);
+	if (!ve)
+		return;
+
+	native_texture = ve->pending_frame_texture;
+	result = submit_frame_direct(ve, native_texture);
+
+	pthread_mutex_lock(&ve->frame_lock);
+	ve->frame_result = result;
+	ve->frame_completed = 1;
+	pthread_cond_broadcast(&ve->frame_changed);
+	pthread_mutex_unlock(&ve->frame_lock);
+}
+
+UNITY_INTERFACE_EXPORT RenderingOutRenderingEvent UNITY_INTERFACE_API
+GetRenderEventFunc(void)
+{
+	return renderingout_render_event;
+}
+#endif
+
+UNITY_INTERFACE_EXPORT int UNITY_INTERFACE_API
 video_encoder_mux_audio(
 	VideoEncoder* ve,
 	const void* pcm_data,
@@ -1522,6 +1669,7 @@ video_encoder_free(VideoEncoder* ve)
 	d3d11_frame_converter_free(&ve->converter);
 	av_buffer_unref(&ve->hw_frames);
 #else
+	stop_frame_sync(ve);
 	opengl_frame_converter_free(&ve->converter);
 #endif
 	av_packet_free(&ve->packet);
