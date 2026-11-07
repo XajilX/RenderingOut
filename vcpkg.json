@@ -2,7 +2,7 @@
   "name": "renderingout",
   "version-string": "0.1.0",
   "builtin-baseline": "3ddaad9be959816602453ecb05533f8732464ef4",
-  "supports": "windows & x64",
+  "supports": "windows | linux",
   "dependencies": [
     {
       "name": "ffmpeg",
@@ -11,7 +11,8 @@
         "avcodec",
         "avformat",
         "swscale",
-        "swresample"
+        "swresample",
+        "x264"
       ]
     }
   ]

@@ -5,17 +5,33 @@
 #include <string.h>
 
 #include <libavutil/hwcontext.h>
-#include <libavutil/hwcontext_d3d11va.h>
 #include <libavutil/log.h>
 
+#ifdef _WIN32
+#include <libavutil/hwcontext_d3d11va.h>
+
 #include <IUnityGraphicsD3D11.h>
+#else
+#include <IUnityGraphics.h>
+#endif
 #include <IUnityLog.h>
 
+#ifdef _WIN32
 static ID3D11Device* s_device = NULL;
 static ID3D11DeviceContext* s_device_context = NULL;
+#else
+static int s_supported = 0;
+#endif
 static AVBufferRef* s_hw_device = NULL;
 static IUnityLog* s_unity_log = NULL;
-static __declspec(thread) int s_probe_logging_suppressed = 0;
+
+#if defined(_MSC_VER)
+#define RENDERINGOUT_THREAD_LOCAL __declspec(thread)
+#else
+#define RENDERINGOUT_THREAD_LOCAL _Thread_local
+#endif
+
+static RENDERINGOUT_THREAD_LOCAL int s_probe_logging_suppressed = 0;
 
 static void renderingout_ffmpeg_log_callback(
 	void* context,
@@ -82,6 +98,21 @@ void renderingout_set_probe_logging_suppressed(int suppressed)
         s_probe_logging_suppressed = suppressed != 0;
 }
 
+AVBufferRef* renderingout_get_hw_device(void)
+{
+	return s_hw_device;
+}
+
+int renderingout_is_supported(void)
+{
+#ifdef _WIN32
+	return s_hw_device != NULL;
+#else
+	return s_supported;
+#endif
+}
+
+#ifdef _WIN32
 ID3D11Device* renderingout_get_d3d11_device(void)
 {
 	return s_device;
@@ -91,26 +122,43 @@ ID3D11DeviceContext* renderingout_get_d3d11_context(void)
 {
 	return s_device_context;
 }
-
-AVBufferRef* renderingout_get_hw_device(void)
-{
-	return s_hw_device;
-}
+#endif
 
 UNITY_INTERFACE_EXPORT void UNITY_INTERFACE_API
 UnityPluginLoad(IUnityInterfaces* unity_interfaces)
 {
+#ifdef _WIN32
 	IUnityGraphicsD3D11* d3d11;
 	AVHWDeviceContext* hwctx;
 	AVD3D11VADeviceContext* d3dctx;
 	int ret;
+#else
+	IUnityGraphics* graphics;
+	UnityGfxRenderer renderer;
+#endif
 
-	s_unity_log = unity_interfaces->GetInterface(IUnityLog_GUID);
+	if (!unity_interfaces)
+		return;
+
+	/*
+	 * UnityInterfaceGUID is a non-trivial type in C++, so the C++ ABI for
+	 * GetInterface(UnityInterfaceGUID) differs from the C ABI. C plugins must
+	 * use GetInterfaceSplit, as UNITY_GET_INTERFACE does in the Unity headers.
+	 */
+	s_unity_log = (IUnityLog*)unity_interfaces->GetInterfaceSplit(
+		IUnityLog_GUID.m_GUIDHigh,
+		IUnityLog_GUID.m_GUIDLow);
+	if (!s_unity_log)
+		return;
+
 	av_log_set_level(AV_LOG_VERBOSE);
 	av_log_set_callback(renderingout_ffmpeg_log_callback);
 	UNITY_LOG(s_unity_log, "RenderingOut: plugin loading.");
 
-	d3d11 = unity_interfaces->GetInterface(IUnityGraphicsD3D11_GUID);
+#ifdef _WIN32
+	d3d11 = (IUnityGraphicsD3D11*)unity_interfaces->GetInterfaceSplit(
+		IUnityGraphicsD3D11_GUID.m_GUIDHigh,
+		IUnityGraphicsD3D11_GUID.m_GUIDLow);
 	if (!d3d11)
 	{
 		UNITY_LOG_ERROR(s_unity_log, "RenderingOut: D3D11 interface not available.");
@@ -170,6 +218,33 @@ UnityPluginLoad(IUnityInterfaces* unity_interfaces)
 
 	s_device_context = d3dctx->device_context;
 	UNITY_LOG(s_unity_log, "RenderingOut: plugin loaded successfully.");
+#else
+	graphics = (IUnityGraphics*)unity_interfaces->GetInterfaceSplit(
+		IUnityGraphics_GUID.m_GUIDHigh,
+		IUnityGraphics_GUID.m_GUIDLow);
+	if (!graphics)
+	{
+		UNITY_LOG_ERROR(
+			s_unity_log,
+			"RenderingOut: Unity graphics interface not available.");
+		return;
+	}
+
+	renderer = graphics->GetRenderer();
+	if (renderer != kUnityGfxRendererOpenGLCore)
+	{
+		UNITY_LOG_ERROR(
+			s_unity_log,
+			"RenderingOut: Linux requires Unity's OpenGL Core renderer. "
+			"Launch Unity with -force-glcore (Vulkan is not supported).");
+		return;
+	}
+
+	s_supported = 1;
+	UNITY_LOG(
+		s_unity_log,
+		"RenderingOut: plugin loaded successfully with OpenGL Core.");
+#endif
 }
 
 UNITY_INTERFACE_EXPORT void UNITY_INTERFACE_API
@@ -177,11 +252,15 @@ UnityPluginUnload(void)
 {
 	/*
 	 * VideoEncoder instances must be freed before the plugin unloads because
-	 * their hardware frame pools retain this device context.
+	 * they may retain renderer resources and an active worker thread.
 	 */
+#ifdef _WIN32
 	s_device_context = NULL;
 	s_device = NULL;
 	av_buffer_unref(&s_hw_device);
+#else
+	s_supported = 0;
+#endif
 	av_log_set_callback(av_log_default_callback);
 	s_unity_log = NULL;
 }

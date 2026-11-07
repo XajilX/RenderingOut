@@ -1,23 +1,33 @@
 #include "RenderingOut.h"
 
-#include "D3D11FrameConverter.h"
 #include "Unity.h"
 
 #include <errno.h>
-#include <objbase.h>
-#include <process.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+
+#ifdef _WIN32
+#include "D3D11FrameConverter.h"
+
+#include <objbase.h>
+#include <process.h>
 #include <windows.h>
+#else
+#include "OpenGLFrameConverter.h"
+
+#include <pthread.h>
+#endif
 
 #include <libavcodec/avcodec.h>
 #include <libavformat/avformat.h>
 #include <libavutil/dict.h>
 #include <libavutil/error.h>
 #include <libavutil/hwcontext.h>
+#ifdef _WIN32
 #include <libavutil/hwcontext_d3d11va.h>
+#endif
 #include <libavutil/log.h>
 #include <libavutil/mem.h>
 #include <libavutil/opt.h>
@@ -49,24 +59,32 @@ struct VideoEncoder
 	AVStream* audio_stream;
 	AVPacket* packet;
 	AVFrame* audio_frame;
+	int worker_started;
+#ifdef _WIN32
 	AVBufferRef* hw_frames;
 	D3D11FrameConverter* converter;
+	HANDLE worker;
+	CRITICAL_SECTION worker_lock;
+	CONDITION_VARIABLE worker_changed;
+#else
+	OpenGLFrameConverter* converter;
+	pthread_t worker;
+	pthread_mutex_t worker_lock;
+	pthread_cond_t worker_changed;
+#endif
 	char* filename;
 	uint8_t* pending_pcm_data;
 	int64_t pending_pcm_size;
 	int pending_pcm_sample_rate;
 	int pending_pcm_channels;
 
-	HANDLE worker;
-	CRITICAL_SECTION worker_lock;
-	CONDITION_VARIABLE worker_changed;
 	EncoderWorkerCommand worker_command;
 	AVFrame* worker_frame;
 	enum AVPixelFormat worker_texture_format;
 	int worker_multisampled;
 	int worker_result;
 
-	int bit_rate;
+	int quality;
 	int width;
 	int height;
 	int fps;
@@ -112,6 +130,7 @@ static int write_available_packets(
 	}
 }
 
+#ifdef _WIN32
 static int create_hw_frames(
         VideoEncoder* ve,
         enum AVPixelFormat software_format,
@@ -154,15 +173,37 @@ static int create_hw_frames(
         *frames = result;
         return 0;
 }
+#endif
+
+static const int kX264Crf[] = { 28, 23, 18, 14 };
+static const int kNvencCq[] = { 30, 24, 18, 14 };
+static const int kQsvGlobalQuality[] = { 32, 25, 18, 14 };
+static const int kAmfQvbrQuality[] = { 30, 24, 18, 14 };
+static const int64_t kMfBitRate[] = { 4000000, 8000000, 16000000, 32000000 };
+
+static int media_foundation_bit_rate(
+	int quality,
+	int width,
+	int height,
+	int fps)
+{
+	const int64_t reference_pixels_per_second = 1920LL * 1080LL * 60LL;
+	int64_t bit_rate = kMfBitRate[quality] * width * height * fps;
+
+	return (int)((bit_rate + reference_pixels_per_second / 2) /
+		reference_pixels_per_second);
+}
 
 static void set_codec_options(
         const EncoderCandidate* candidate,
+        int quality,
         AVDictionary** options)
 {
 	if (strcmp(candidate->name, "libx264") == 0)
 	{
-		av_dict_set(options, "preset", "veryfast", 0);
+		av_dict_set(options, "preset", "medium", 0);
 		av_dict_set(options, "tune", "zerolatency", 0);
+		av_dict_set_int(options, "crf", kX264Crf[quality], 0);
 	}
 	else if (strcmp(candidate->name, "h264_mf") == 0)
 	{
@@ -171,9 +212,24 @@ static void set_codec_options(
 	}
 	else if (strcmp(candidate->name, "h264_nvenc") == 0)
 	{
+		av_dict_set(options, "rc", "vbr", 0);
+		av_dict_set(options, "preset", "p7", 0);
 		av_dict_set(options, "delay", "0", 0);
 		av_dict_set(options, "zerolatency", "1", 0);
-        }
+		av_dict_set_int(options, "cq", kNvencCq[quality], 0);
+	}
+	else if (strcmp(candidate->name, "h264_qsv") == 0)
+	{
+		av_dict_set(options, "rate_control", "ICQ", 0);
+		av_dict_set_int(
+			options, "global_quality", kQsvGlobalQuality[quality], 0);
+	}
+	else if (strcmp(candidate->name, "h264_amf") == 0)
+	{
+		av_dict_set(options, "rc", "qvbr", 0);
+		av_dict_set_int(
+			options, "qvbr_quality_level", kAmfQvbrQuality[quality], 0);
+	}
 }
 
 static const char* encoder_candidate_mode(const EncoderCandidate* candidate)
@@ -238,7 +294,9 @@ static int try_open_encoder(
 	if (!context)
 		return AVERROR(ENOMEM);
 
-	context->bit_rate = ve->bit_rate;
+	if (strcmp(candidate->name, "h264_mf") == 0)
+		context->bit_rate = media_foundation_bit_rate(
+			ve->quality, ve->width, ve->height, ve->fps);
 	context->width = ve->width;
 	context->height = ve->height;
 	context->framerate = (AVRational){ ve->fps, 1 };
@@ -249,9 +307,13 @@ static int try_open_encoder(
 	if (strcmp(candidate->name, "h264_mf") != 0)
 		context->flags |= AV_CODEC_FLAG_LOW_DELAY;
 
+#ifdef _WIN32
 	context->pix_fmt = candidate->direct_d3d11
 		? AV_PIX_FMT_D3D11
 		: candidate->input_format;
+#else
+	context->pix_fmt = candidate->input_format;
+#endif
 	context->color_range = AVCOL_RANGE_MPEG;
 
 	if (ve->height >= 720)
@@ -270,6 +332,7 @@ static int try_open_encoder(
 	if (ve->format->oformat->flags & AVFMT_GLOBALHEADER)
 		context->flags |= AV_CODEC_FLAG_GLOBAL_HEADER;
 
+#ifdef _WIN32
         if (candidate->direct_d3d11)
         {
                 UINT bind_flags = 0;
@@ -306,8 +369,9 @@ static int try_open_encoder(
 			goto fail;
 		}
 	}
+#endif
 
-	set_codec_options(candidate, &options);
+	set_codec_options(candidate, ve->quality, &options);
 	ret = avcodec_open2(context, codec, &options);
 	av_dict_free(&options);
         if (ret < 0)
@@ -323,7 +387,9 @@ static int try_open_encoder(
 	}
 
 	ve->ctx = context;
+#ifdef _WIN32
 	ve->hw_frames = frames;
+#endif
         ve->input_format = candidate->input_format;
         ve->direct_d3d11 = candidate->direct_d3d11;
 
@@ -351,12 +417,15 @@ static int initialize_encoder(
         char selection_summary[1536] = { 0 };
         char attempt[256];
         int candidate_count = 0;
+#ifdef _WIN32
         int mf_direct_ready = 0;
+#endif
         int i;
         int last_error = AVERROR_ENCODER_NOT_FOUND;
 
         renderingout_set_probe_logging_suppressed(1);
 
+#ifdef _WIN32
         if (!multisampled)
 	{
 		DXGI_FORMAT source_format = DXGI_FORMAT_UNKNOWN;
@@ -405,15 +474,20 @@ static int initialize_encoder(
 	}
 
 	candidates[candidate_count++] =
-		(EncoderCandidate){ "h264_nvenc", texture_format, 0 };
+		(EncoderCandidate){ "h264_nvenc", AV_PIX_FMT_YUV420P, 0 };
 	candidates[candidate_count++] =
 		(EncoderCandidate){ "h264_mf", AV_PIX_FMT_NV12, 0 };
 	candidates[candidate_count++] =
 		(EncoderCandidate){ "h264_amf", AV_PIX_FMT_NV12, 0 };
 	candidates[candidate_count++] =
 		(EncoderCandidate){ "h264_qsv", AV_PIX_FMT_NV12, 0 };
+#else
+	(void)multisampled;
 	candidates[candidate_count++] =
-		(EncoderCandidate){ "libx264", AV_PIX_FMT_NV12, 0 };
+		(EncoderCandidate){ "h264_nvenc", AV_PIX_FMT_YUV420P, 0 };
+#endif
+	candidates[candidate_count++] =
+		(EncoderCandidate){ "libx264", AV_PIX_FMT_YUV420P, 0 };
 
         for (i = 0; i < candidate_count; ++i)
         {
@@ -980,19 +1054,64 @@ static int finish_encoding(VideoEncoder* ve)
 	return result;
 }
 
+static void worker_lock(VideoEncoder* ve)
+{
+#ifdef _WIN32
+	EnterCriticalSection(&ve->worker_lock);
+#else
+	pthread_mutex_lock(&ve->worker_lock);
+#endif
+}
+
+static void worker_unlock(VideoEncoder* ve)
+{
+#ifdef _WIN32
+	LeaveCriticalSection(&ve->worker_lock);
+#else
+	pthread_mutex_unlock(&ve->worker_lock);
+#endif
+}
+
+static void worker_wait(VideoEncoder* ve)
+{
+#ifdef _WIN32
+	SleepConditionVariableCS(
+		&ve->worker_changed, &ve->worker_lock, INFINITE);
+#else
+	pthread_cond_wait(&ve->worker_changed, &ve->worker_lock);
+#endif
+}
+
+static void worker_notify_all(VideoEncoder* ve)
+{
+#ifdef _WIN32
+	WakeAllConditionVariable(&ve->worker_changed);
+#else
+	pthread_cond_broadcast(&ve->worker_changed);
+#endif
+}
+
+#ifdef _WIN32
 static unsigned __stdcall encoder_worker_main(void* parameter)
+#else
+static void* encoder_worker_main(void* parameter)
+#endif
 {
 	VideoEncoder* ve = (VideoEncoder*)parameter;
+#ifdef _WIN32
 	HRESULT com_result;
 	int com_initialized;
+#endif
 	int should_exit = 0;
 
+#ifdef _WIN32
 	/*
 	 * Unity's main thread is STA. Media Foundation requires MTA, so every
 	 * encoder operation, including close, stays on this dedicated MTA thread.
 	 */
 	com_result = CoInitializeEx(NULL, COINIT_MULTITHREADED);
 	com_initialized = SUCCEEDED(com_result);
+#endif
 
 	while (!should_exit)
 	{
@@ -1002,16 +1121,15 @@ static unsigned __stdcall encoder_worker_main(void* parameter)
 		int multisampled;
 		int result = 0;
 
-		EnterCriticalSection(&ve->worker_lock);
+		worker_lock(ve);
 		while (ve->worker_command == ENCODER_COMMAND_NONE)
-			SleepConditionVariableCS(
-				&ve->worker_changed, &ve->worker_lock, INFINITE);
+			worker_wait(ve);
 
 		command = ve->worker_command;
 		frame = ve->worker_frame;
 		texture_format = ve->worker_texture_format;
 		multisampled = ve->worker_multisampled;
-		LeaveCriticalSection(&ve->worker_lock);
+		worker_unlock(ve);
 
 		switch (command)
 		{
@@ -1045,17 +1163,77 @@ static unsigned __stdcall encoder_worker_main(void* parameter)
 			break;
 		}
 
-		EnterCriticalSection(&ve->worker_lock);
+		worker_lock(ve);
 		ve->worker_frame = NULL;
 		ve->worker_result = result;
 		ve->worker_command = ENCODER_COMMAND_NONE;
-		WakeAllConditionVariable(&ve->worker_changed);
-		LeaveCriticalSection(&ve->worker_lock);
+		worker_notify_all(ve);
+		worker_unlock(ve);
 	}
 
+#ifdef _WIN32
 	if (com_initialized)
 		CoUninitialize();
 	return 0;
+#else
+	return NULL;
+#endif
+}
+
+static int start_worker(VideoEncoder* ve)
+{
+#ifdef _WIN32
+	InitializeCriticalSection(&ve->worker_lock);
+	InitializeConditionVariable(&ve->worker_changed);
+	ve->worker = (HANDLE)_beginthreadex(
+		NULL, 0, encoder_worker_main, ve, 0, NULL);
+	if (!ve->worker)
+	{
+		DeleteCriticalSection(&ve->worker_lock);
+		return AVERROR(EIO);
+	}
+#else
+	int ret;
+
+	ret = pthread_mutex_init(&ve->worker_lock, NULL);
+	if (ret != 0)
+		return AVERROR(ret);
+	ret = pthread_cond_init(&ve->worker_changed, NULL);
+	if (ret != 0)
+	{
+		pthread_mutex_destroy(&ve->worker_lock);
+		return AVERROR(ret);
+	}
+	ret = pthread_create(
+		&ve->worker, NULL, encoder_worker_main, ve);
+	if (ret != 0)
+	{
+		pthread_cond_destroy(&ve->worker_changed);
+		pthread_mutex_destroy(&ve->worker_lock);
+		return AVERROR(ret);
+	}
+#endif
+
+	ve->worker_started = 1;
+	return 0;
+}
+
+static void stop_worker(VideoEncoder* ve)
+{
+	if (!ve->worker_started)
+		return;
+
+#ifdef _WIN32
+	WaitForSingleObject(ve->worker, INFINITE);
+	CloseHandle(ve->worker);
+	ve->worker = NULL;
+	DeleteCriticalSection(&ve->worker_lock);
+#else
+	pthread_join(ve->worker, NULL);
+	pthread_cond_destroy(&ve->worker_changed);
+	pthread_mutex_destroy(&ve->worker_lock);
+#endif
+	ve->worker_started = 0;
 }
 
 static int dispatch_worker_command(
@@ -1067,32 +1245,30 @@ static int dispatch_worker_command(
 {
 	int result;
 
-	if (!ve->worker)
+	if (!ve->worker_started)
 		return AVERROR(EINVAL);
 
-	EnterCriticalSection(&ve->worker_lock);
+	worker_lock(ve);
 	while (ve->worker_command != ENCODER_COMMAND_NONE)
-		SleepConditionVariableCS(
-			&ve->worker_changed, &ve->worker_lock, INFINITE);
+		worker_wait(ve);
 
 	ve->worker_frame = frame;
 	ve->worker_texture_format = texture_format;
 	ve->worker_multisampled = multisampled;
 	ve->worker_command = command;
-	WakeAllConditionVariable(&ve->worker_changed);
+	worker_notify_all(ve);
 
 	while (ve->worker_command != ENCODER_COMMAND_NONE)
-		SleepConditionVariableCS(
-			&ve->worker_changed, &ve->worker_lock, INFINITE);
+		worker_wait(ve);
 
 	result = ve->worker_result;
-	LeaveCriticalSection(&ve->worker_lock);
+	worker_unlock(ve);
 	return result;
 }
 
 UNITY_INTERFACE_EXPORT VideoEncoder* UNITY_INTERFACE_API
 video_encoder_create(
-	int bit_rate,
+	int quality,
 	int width,
 	int height,
 	int fps,
@@ -1101,17 +1277,17 @@ video_encoder_create(
 	VideoEncoder* ve;
 	int ret;
 
-	if (bit_rate <= 0 || width <= 0 || height <= 0 || fps <= 0 ||
+	if (quality < 0 || quality > 3 || width <= 0 || height <= 0 || fps <= 0 ||
 		!filename || (width & 1) || (height & 1))
 		return NULL;
-	if (!renderingout_get_hw_device())
+	if (!renderingout_is_supported())
 		return NULL;
 
 	ve = (VideoEncoder*)calloc(1, sizeof(*ve));
 	if (!ve)
 		return NULL;
 
-	ve->bit_rate = bit_rate;
+	ve->quality = quality;
 	ve->width = width;
 	ve->height = height;
 	ve->fps = fps;
@@ -1120,8 +1296,8 @@ video_encoder_create(
 		goto fail;
 
 	renderingout_logf(
-		"RenderingOut: video_encoder_create('%s', %dx%d @ %d fps, bitrate: %d bps)",
-		filename, width, height, fps, bit_rate);
+		"RenderingOut: video_encoder_create('%s', %dx%d @ %d fps, quality: %d)",
+		filename, width, height, fps, quality);
 
 	ret = avformat_alloc_output_context2(
 		&ve->format, NULL, NULL, filename);
@@ -1132,29 +1308,35 @@ video_encoder_create(
 	if (!ve->packet)
 		goto fail;
 
+#ifdef _WIN32
 	ret = d3d11_frame_converter_create(
 		&ve->converter,
 		renderingout_get_hw_device(),
 		width,
 		height,
 		fps);
+#else
+	ret = opengl_frame_converter_create(
+		&ve->converter,
+		width,
+		height,
+		fps);
+#endif
 	if (ret < 0)
 		goto fail;
 
-	InitializeCriticalSection(&ve->worker_lock);
-	InitializeConditionVariable(&ve->worker_changed);
-	ve->worker = (HANDLE)_beginthreadex(
-		NULL, 0, encoder_worker_main, ve, 0, NULL);
-	if (!ve->worker)
-	{
-		DeleteCriticalSection(&ve->worker_lock);
+	ret = start_worker(ve);
+	if (ret < 0)
 		goto fail;
-	}
 
 	return ve;
 
 fail:
+#ifdef _WIN32
 	d3d11_frame_converter_free(&ve->converter);
+#else
+	opengl_frame_converter_free(&ve->converter);
+#endif
 	av_packet_free(&ve->packet);
 	avformat_free_context(ve->format);
 	av_freep(&ve->filename);
@@ -1165,17 +1347,22 @@ fail:
 UNITY_INTERFACE_EXPORT int UNITY_INTERFACE_API
 video_encoder_submit_frame(VideoEncoder* ve, void* native_texture)
 {
+#ifdef _WIN32
 	ID3D11Resource* resource = (ID3D11Resource*)native_texture;
 	D3D11_TEXTURE2D_DESC desc;
+#else
+	OpenGLTextureInfo texture_info;
+#endif
 	enum AVPixelFormat texture_format;
 	AVFrame* frame = NULL;
 	int ret;
 
-	if (!ve || !resource)
+	if (!ve || !native_texture)
 		return AVERROR(EINVAL);
 	if (ve->fatal_error < 0)
 		return ve->fatal_error;
 
+#ifdef _WIN32
 	ret = d3d11_resource_texture_desc(resource, &desc);
 	if (ret < 0)
 		return ret;
@@ -1185,6 +1372,15 @@ video_encoder_submit_frame(VideoEncoder* ve, void* native_texture)
 	texture_format = d3d11_texture_pixel_format(desc.Format);
 	if (texture_format == AV_PIX_FMT_NONE)
 		return AVERROR(ENOSYS);
+#else
+	ret = opengl_texture_info(native_texture, &texture_info);
+	if (ret < 0)
+		return ret;
+	if (texture_info.width != ve->width ||
+		texture_info.height != ve->height)
+		return AVERROR(EINVAL);
+	texture_format = texture_info.format;
+#endif
 
 	if (!ve->initialized)
 	{
@@ -1193,7 +1389,11 @@ video_encoder_submit_frame(VideoEncoder* ve, void* native_texture)
 			ENCODER_COMMAND_INITIALIZE,
 			NULL,
 			texture_format,
+#ifdef _WIN32
 			desc.SampleDesc.Count > 1);
+#else
+			texture_info.multisampled);
+#endif
 		if (ret < 0)
 		{
 			renderingout_log_errorf(
@@ -1207,6 +1407,7 @@ video_encoder_submit_frame(VideoEncoder* ve, void* native_texture)
 		return AVERROR(EINVAL);
 	}
 
+#ifdef _WIN32
 	if (ve->direct_d3d11)
 	{
 		if (desc.SampleDesc.Count != 1)
@@ -1227,6 +1428,14 @@ video_encoder_submit_frame(VideoEncoder* ve, void* native_texture)
 			ve->next_pts,
 			&frame);
 	}
+#else
+	ret = opengl_frame_capture(
+		ve->converter,
+		native_texture,
+		ve->input_format,
+		ve->next_pts,
+		&frame);
+#endif
 	if (ret < 0)
 	{
 		renderingout_log_errorf(
@@ -1300,20 +1509,21 @@ video_encoder_free(VideoEncoder* ve)
 	if (!ve)
 		return;
 
-	if (ve->worker)
+	if (ve->worker_started)
 	{
 		dispatch_worker_command(
 			ve, ENCODER_COMMAND_FINISH, NULL, AV_PIX_FMT_NONE, 0);
 		dispatch_worker_command(
 			ve, ENCODER_COMMAND_EXIT, NULL, AV_PIX_FMT_NONE, 0);
-		WaitForSingleObject(ve->worker, INFINITE);
-		CloseHandle(ve->worker);
-		ve->worker = NULL;
-		DeleteCriticalSection(&ve->worker_lock);
+		stop_worker(ve);
 	}
 
+#ifdef _WIN32
 	d3d11_frame_converter_free(&ve->converter);
 	av_buffer_unref(&ve->hw_frames);
+#else
+	opengl_frame_converter_free(&ve->converter);
+#endif
 	av_packet_free(&ve->packet);
 	avcodec_free_context(&ve->audio_ctx);
 	av_frame_free(&ve->audio_frame);

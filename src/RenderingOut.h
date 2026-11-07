@@ -8,9 +8,12 @@ extern "C" {
 
 typedef struct VideoEncoder VideoEncoder;
 
+/*
+ * quality: 0 = Low, 1 = Medium, 2 = High, 3 = Ultra.
+ */
 UNITY_INTERFACE_EXPORT VideoEncoder* UNITY_INTERFACE_API
 video_encoder_create(
-    int bit_rate,
+    int quality,
     int width,
     int height,
     int fps,
@@ -19,7 +22,9 @@ video_encoder_create(
 
 /*
  * native_texture is the IntPtr returned by Texture.GetNativeTexturePtr().
- * Must be called serially from the render thread that owns the texture.
+ * On Windows it is an ID3D11Texture2D; on Linux it is a GLuint OpenGL texture
+ * name. Must be called serially from the render thread that owns the texture
+ * and has the corresponding graphics context current.
  * Returns 0 on success or a negative AVERROR value on failure.
  */
 UNITY_INTERFACE_EXPORT int UNITY_INTERFACE_API
